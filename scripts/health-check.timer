@@ -1,0 +1,12 @@
+[Unit]
+Description=Educated Trades External Health Check Timer
+Requires=health-check.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=300s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

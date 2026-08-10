@@ -1,0 +1,23 @@
+{
+  "ma_type": "EMA",
+  "fast_period": 15,
+  "slow_period": 30,
+  "direction": "long_only",
+  "rsi_period": 14,
+  "adx_period": 14,
+  "train_performance": {
+    "total_return_pct": 12.07,
+    "sharpe": 0.604,
+    "num_trades": 142,
+    "win_rate_pct": 53.52,
+    "max_drawdown_pct": -10.73
+  },
+  "test_performance": {
+    "total_return_pct": -2.74,
+    "sharpe": -0.314,
+    "num_trades": 51,
+    "win_rate_pct": 49.02,
+    "max_drawdown_pct": -8.65
+  },
+  "generated_at": "2026-07-04T05:39:24.630735Z"
+}

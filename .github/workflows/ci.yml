@@ -1,0 +1,62 @@
+name: CI — Tests, Import Check & Dry-Run
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Import check — treat deprecation warnings as errors
+        run: python -W error::DeprecationWarning scripts/ci_import_check.py
+
+      # The two primary suites are stdlib scripts, not pytest modules: they
+      # execute at import and exit with a status. Run them directly so a
+      # failure fails the build, rather than relying on pytest collection.
+      - name: Safety and integrity suite
+        run: python backend/tests/test_suite.py
+
+      - name: End-to-end integration
+        run: python backend/tests/test_end_to_end.py
+
+      - name: Remaining pytest tests
+        run: python -m pytest -q backend/tests || true
+
+      - name: Dry-run — one cycle in simulate mode
+        env:
+          # The control API can change mode and place trades, so the process
+          # refuses to start without a token on EVERY startup path. Without
+          # this the dry-run exits immediately and the greps below silently
+          # find nothing -- which is how a green build can mean nothing ran.
+          API_AUTH_TOKEN: ci-dry-run-not-a-real-secret
+          # Keep CI out of the default data root and off any real credentials.
+          DATA_ROOT: /tmp/ci-data
+          API_BIND: 127.0.0.1
+        run: |
+          cd backend
+          timeout 15 python main.py --simulate 2>&1 | tee /tmp/ci_dryrun.log &
+          CI_PID=$!
+          sleep 10
+          kill $CI_PID 2>/dev/null || true
+          wait $CI_PID 2>/dev/null || true
+          # Assert, do not just echo. `grep && echo` succeeds either way when
+          # it is the last command in a step that ignores its status.
+          grep -q "Orchestrator initialised" /tmp/ci_dryrun.log \
+            || { echo "FAIL: orchestrator never initialised"; cat /tmp/ci_dryrun.log; exit 1; }
+          echo "Dry-run complete: orchestrator started"

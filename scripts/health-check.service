@@ -1,0 +1,19 @@
+[Unit]
+Description=Educated Trades External Health Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/educated_trades/backend/../scripts/health_check.py
+EnvironmentFile=/etc/educated-trades-health.env
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+StateDirectory=educated-trades-health
+Environment=HEALTH_STATE_FILE=/var/lib/educated-trades-health/state.json
+WorkingDirectory=/opt/educated_trades
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict

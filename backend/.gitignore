@@ -1,0 +1,4 @@
+# Data backup snapshots — generated files, not tracked in the main repo tree
+data_backup.egg-info/
+__pycache__/
+*.pyc

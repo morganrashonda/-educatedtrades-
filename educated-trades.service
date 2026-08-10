@@ -1,0 +1,21 @@
+[Unit]
+Description=Educated Trades — Autonomous Trading Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-lead
+WorkingDirectory=/home/team/shared/backend
+EnvironmentFile=/home/team/shared/.env
+# `--autonomous` was passed here and parsed by nothing: the unit promised
+# autonomous operation while the bot started MANUAL. Mode is owned by
+# {DATA_DIR}/orchestrator_mode.txt and changed with POST /api/mode
+# (docs/MODE_PRECEDENCE.md). main.py now warns about unrecognised flags
+# rather than ignoring them in silence.
+ExecStart=/home/team/shared/backend/venv/bin/python main.py --live
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
