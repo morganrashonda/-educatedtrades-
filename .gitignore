@@ -43,3 +43,26 @@ site/build/
 # ---- Runtime data files (not tracked) ----
 audit_log.jsonl
 *.jsonl
+
+# ---- Runtime state the bot writes ----
+# These normally live under DATA_ROOT, outside the repo. But DATA_DIR can be
+# pointed anywhere, and a stray run inside the working tree would otherwise
+# commit live operating state to a PUBLIC repository: open positions, kill
+# state, reconciliation reports. Cheap insurance against an expensive slip.
+killed_state
+heartbeat
+KILL_SWITCH
+RESET_DRAWDOWN
+orchestrator_mode.txt
+daily_risk_state.json
+position_state.json
+reconciliation_latest.json
+overnight_risk_latest.json
+backfill_status.json
+send_lead_message.txt
+watchdog_alert_state.json
+health_state.json
+execution_ledger.json*
+patterns_fits/
+backup_repo/
+notifications/
