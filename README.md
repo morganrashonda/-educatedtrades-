@@ -55,8 +55,8 @@ question that only forward testing can answer.
 ## Setup
 
 ```bash
-git clone https://github.com/<your-account>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/morganrashonda/-educatedtrades-.git
+cd -educatedtrades-
 
 cp .env.example .env
 $EDITOR .env
@@ -91,9 +91,9 @@ cd backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-python main.py --live       # connect to the broker
-python main.py --simulate   # never place real orders
-python main.py --api-only   # serve the API without the trading loop
+python3 main.py --live       # connect to the broker
+python3 main.py --simulate   # never place real orders
+python3 main.py --api-only   # serve the API without the trading loop
 ```
 
 **Operating mode is not settable from the command line.** It is owned by
@@ -153,8 +153,8 @@ Operating detail and the reasoning behind every parameter are in
 ## Tests
 
 ```bash
-python backend/tests/test_suite.py        # unit, integrity, concurrency
-python backend/tests/test_end_to_end.py   # full chain, real objects, stubbed broker
+python3 backend/tests/test_suite.py        # unit, integrity, concurrency
+python3 backend/tests/test_end_to_end.py   # full chain, real objects, stubbed broker
 ```
 
 Neither requires pytest. The end-to-end suite wires the real components together
