@@ -1,5 +1,5 @@
 import type { PatternSummary } from '../types';
-import { Award, Zap, ShieldCheck, TrendingUp, BarChart3 } from 'lucide-react';
+import { Award, Zap, ShieldCheck, BarChart3 } from 'lucide-react';
 
 export function TopPatterns({ patterns }: { patterns: PatternSummary[] }) {
   return (
@@ -25,7 +25,7 @@ export function TopPatterns({ patterns }: { patterns: PatternSummary[] }) {
             <p className="text-sm text-trade-400 italic">Gathering more data...</p>
           </div>
         ) : (
-          patterns.slice(0, 4).map((p, i) => (
+          patterns.slice(0, 4).map((p) => (
             <div key={p.signature} className="flex items-center justify-between p-3 rounded-xl bg-trade-700/30 border border-trade-600/20 transition-all duration-200 hover:bg-trade-700/50 hover:border-trade-500/30">
               <div className="flex items-center gap-3 min-w-0">
                 <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${

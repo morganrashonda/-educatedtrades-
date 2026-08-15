@@ -1,5 +1,5 @@
 import type { Portfolio } from "../types";
-import { TrendingUp, TrendingDown, DollarSign, Target, Wallet, BarChart3, Gauge } from "lucide-react";
+import { TrendingUp, TrendingDown, DollarSign, Target, Wallet, Gauge } from "lucide-react";
 
 export function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
   const isPnlPositive = portfolio.pnlDay >= 0;

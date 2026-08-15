@@ -1,5 +1,5 @@
 import type { Milestone } from '../types';
-import { Target, TrendingUp, Award, Rocket } from 'lucide-react';
+import { Target, Award, Rocket } from 'lucide-react';
 
 export function MilestoneTracker({ milestones }: { milestones: Milestone[] }) {
   const milestone = milestones?.[0] || { target: 1000, current: 0, percent: 0, remaining: 1000 };

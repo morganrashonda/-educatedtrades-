@@ -9,7 +9,10 @@ type StatusBarProps = {
 
 export function StatusBar({ lastUpdate, apiConnected, cycleCount }: StatusBarProps) {
   const [serverTime, setServerTime] = useState(new Date().toLocaleTimeString());
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  // Latency was never wired up: the setter was never called, so this stayed
+  // null and the readout below never rendered. Kept as an explicit constant
+  // rather than deleted, so the intent survives until it is measured for real.
+  const latencyMs: number | null = null;
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {

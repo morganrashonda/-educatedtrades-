@@ -1,5 +1,5 @@
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { Activity, TrendingUp } from 'lucide-react';
+import { TrendingUp } from 'lucide-react';
 
 const defaultData = [
   { time: '09:00', value: 100000, sentiment: 0.2 },
@@ -12,8 +12,6 @@ const defaultData = [
 ];
 
 export function PerformanceChart({ data = defaultData }: { data?: any[] }) {
-  const isPositive = data.length >= 2 && data[data.length - 1]?.value >= data[0]?.value;
-
   return (
     <div className="card p-6 h-[380px]">
       <div className="flex items-center justify-between mb-6">

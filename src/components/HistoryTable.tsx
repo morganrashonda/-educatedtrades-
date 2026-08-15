@@ -1,5 +1,5 @@
 import type { Trade } from "../types";
-import { ArrowUpRight, ArrowDownRight, Clock, Eye, ExternalLink } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, Clock, ExternalLink } from "lucide-react";
 
 export function HistoryTable({ trades }: { trades: Trade[] }) {
   return (

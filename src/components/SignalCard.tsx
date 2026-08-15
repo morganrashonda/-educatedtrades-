@@ -1,5 +1,5 @@
 import type { Signal } from "../types";
-import { Zap, Brain, TrendingUp, TrendingDown, Signal as SignalIcon } from "lucide-react";
+import { Zap, Brain, TrendingUp, Signal as SignalIcon } from "lucide-react";
 
 export function SignalCard({ signal }: { signal: Signal }) {
   const getRecommendationColor = (rec: Signal['recommendation']) => {

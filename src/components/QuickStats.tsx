@@ -1,7 +1,6 @@
 import { AnimatedCounter } from "./AnimatedCounter";
 import {
   TrendingUp,
-  TrendingDown,
   BarChart3,
   Activity,
   Zap,
