@@ -349,7 +349,15 @@ class MarketSentimentEngine:
 
         # 4. Blend into conviction score
         vader_conf_score = abs(vader_scores.get("pos", 0) - vader_scores.get("neg", 0))
-        conviction = self._blend_conviction(vader_compound, market_adjust, vader_conf_score)
+        # The default keyword table is intentionally empty: headline
+        # sentiment is telemetry only and must remain neutral rather than
+        # allowing VADER to reintroduce an unvalidated trading signal.
+        if not self.keyword_weights:
+            conviction = 0.0
+        else:
+            conviction = self._blend_conviction(
+                vader_compound, market_adjust, vader_conf_score
+            )
 
         return HeadlineResult(
             headline=headline,

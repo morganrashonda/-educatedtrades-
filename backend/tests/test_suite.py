@@ -1240,8 +1240,9 @@ def sized(equity, ref_price, buying_power=None, risk=0.005, max_pos=0.15,
     br = live_broker(order())
     eng = TradingEngine(alpaca_broker=br, max_position_size=max_pos,
                         risk_per_trade=risk)
-    eng._get_reference_price = staticmethod(lambda sym: ref_price)
-    TradingEngine._get_reference_price = staticmethod(lambda sym: ref_price)
+    # Bind directly to the instance.  Assigning ``staticmethod(...)`` to an
+    # instance leaves a non-callable descriptor on Python 3.9.
+    eng._get_reference_price = lambda sym: ref_price
     acct = AccountInfo()
     acct.equity = equity
     acct.buying_power = equity if buying_power is None else buying_power
