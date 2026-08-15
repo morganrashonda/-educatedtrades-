@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { getHeartbeat } from "../server/api";
+import { fetchHeartbeat } from "../server/actions";
 import { Heart, Activity, Clock, Zap, Bot } from "lucide-react";
 
 type HeartbeatData = {
@@ -18,9 +18,13 @@ export function HeartbeatStatus() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    const fetchHeartbeat = async () => {
+    // Named `poll`, deliberately not `fetchHeartbeat`. The imported server
+    // function is called `fetchHeartbeat`; a local of the same name shadows it
+    // and turns the call below into unbounded recursion, which the catch
+    // swallows into a permanent "not alive". Caught by tsc, not by review.
+    const poll = async () => {
       try {
-        const data = await getHeartbeat();
+        const data = await fetchHeartbeat();
         if (data && data.status === 'alive') {
           setHeartbeat(data);
           setIsAlive(true);
@@ -33,9 +37,9 @@ export function HeartbeatStatus() {
       }
     };
 
-    fetchHeartbeat();
+    poll();
 
-    intervalRef.current = setInterval(fetchHeartbeat, 15000);
+    intervalRef.current = setInterval(poll, 15000);
 
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { AlertTriangle, Shield, ShieldOff, RotateCcw, Zap } from "lucide-react";
-import { triggerKillSwitch, resetKillSwitch } from "../server/api";
+import { killSwitch, resetKill } from "../server/actions";
 
 export function KillSwitchPanel({ killSwitchActive, onStatusChange }: { killSwitchActive: boolean; onStatusChange?: (active: boolean) => void }) {
   const [loading, setLoading] = useState<'kill' | 'reset' | null>(null);
@@ -10,7 +10,7 @@ export function KillSwitchPanel({ killSwitchActive, onStatusChange }: { killSwit
     setLoading('kill');
     setError(null);
     try {
-      const result = await triggerKillSwitch();
+      const result = await killSwitch();
       if (result) {
         onStatusChange?.(true);
       } else {
@@ -27,7 +27,7 @@ export function KillSwitchPanel({ killSwitchActive, onStatusChange }: { killSwit
     setLoading('reset');
     setError(null);
     try {
-      const result = await resetKillSwitch();
+      const result = await resetKill();
       if (result) {
         onStatusChange?.(false);
       } else {

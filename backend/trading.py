@@ -648,14 +648,47 @@ class AlpacaBroker:
             "mode": "simulation" if self._simulate else "live",
         })
 
-        if self._client and self._connected:
+        # Dispatch on INTENT, never on connectivity.
+        #
+        # This read `if self._client and self._connected: live else: simulated`.
+        # Simulation was therefore a FALLBACK: a live broker whose connection
+        # dropped -- `_simulate` still False, `_connected` now False -- fell
+        # through and produced a FABRICATED FILL, while the audit record above
+        # said `"mode": "live"`. The system would hold a position that the
+        # broker never received, with P&L, learning data and slippage all
+        # computed from a price nobody traded at.
+        #
+        # Two real states reach that: live initialisation failing, and
+        # reconnect() failing. A DNS outage during an order is enough.
+        #
+        # Simulation is a mode you choose, not a thing that happens to you.
+        # Live intent with no broker must REFUSE, exactly like every other
+        # unresolvable state in this system.
+        if self._simulate:
+            result = self._execute_simulated(
+                symbol, side, quantity, order_type, limit_price,
+            )
+        elif self._client and self._connected:
             result = self._execute_live(
                 symbol, side, quantity, order_type, limit_price, time_in_force,
                 stop_loss_pct, take_profit_pct, reference_price, client_order_id,
             )
         else:
-            result = self._execute_simulated(
-                symbol, side, quantity, order_type, limit_price,
+            detail = ("broker not connected"
+                      if self._client else "broker client not initialised")
+            if self._initialization_error:
+                detail += " (%s)" % self._initialization_error
+            logger.error(
+                "REFUSING %s %s %s: live intent but %s. No order placed, and "
+                "no simulated fill fabricated.",
+                getattr(side, "value", side), quantity, symbol, detail)
+            result = ExecutionResult(
+                success=False, symbol=symbol, side=side, quantity=0,
+                filled_price=None, filled_qty=0, order_id=None,
+                status=OrderStatus.REJECTED, latency_ms=0,
+                error="Broker unavailable: %s" % detail,
+                details={"refused_no_broker": True,
+                         "environment": self.environment},
             )
 
         result.latency_ms = round((time.time() - start_time) * 1000, 1)
@@ -878,49 +911,98 @@ class AlpacaBroker:
     # Position Management
     # ------------------------------------------------------------------
     def close_position(self, symbol: str) -> ExecutionResult:
-        """Close an open position for a symbol."""
-        if self._client and self._connected:
-            try:
-                closed = self._client.close_position(symbol)
-                # close_position only SUBMITS a liquidating order. Treating it
-                # as filled -- and dropping local state -- would strand a live
-                # position if it does not fill. Confirm flatness first.
-                confirmed_flat = False
-                try:
-                    confirmed_flat = self.get_position_strict(symbol) is None
-                except Exception as probe_error:
-                    logger.warning(
-                        "Could not confirm %s is flat after close: %s",
-                        symbol, probe_error,
-                    )
-                res = ExecutionResult(
-                    success=True, symbol=symbol, side=None,
-                    quantity=0, filled_price=None, filled_qty=0,
-                    order_id=closed.id if hasattr(closed, 'id') else None,
-                    status=OrderStatus.FILLED if confirmed_flat else OrderStatus.PENDING,
-                    latency_ms=0,
-                    details={"confirmed_flat": confirmed_flat},
-                )
-                # Only forget the position once the broker confirms it is gone.
-                if confirmed_flat:
-                    _remove_persisted_position(symbol)
-            except Exception as e:
-                res = ExecutionResult(
-                    success=False, symbol=symbol, side=None,
-                    quantity=0, filled_price=None, filled_qty=0,
-                    order_id=None, status=OrderStatus.ERROR, latency_ms=0,
-                    error=str(e),
-                )
-        else:
+        """Close an open position. `success` means CONFIRMED FLAT, nothing less.
+
+        Two defects lived here, both of the same family: the function claimed
+        more than it knew.
+
+        1. `success=True` was returned whether or not the broker confirmed the
+           position was gone -- only `status` distinguished FILLED from
+           PENDING, and every caller keys on `.success`. An unconfirmed close
+           was therefore recorded as a completed trade: phantom P&L, tracking
+           removed, and a live position left with nothing watching it.
+
+        2. Dispatch keyed on `_connected`, so a live broker that lost its
+           connection fell through to the simulated branch and returned
+           `success=True, FILLED` for a close that was never submitted -- then
+           deleted the persisted position. The bot would believe it was flat
+           while holding real exposure.
+
+        Now: simulation runs only when simulation is the chosen mode; live
+        intent without a broker refuses; and success requires the broker to
+        confirm flatness. An unconfirmed submission returns success=False with
+        the exit still recorded, so reconciliation resolves it rather than the
+        caller assuming it is done.
+        """
+        if self._simulate:
             res = ExecutionResult(
                 success=True, symbol=symbol, side=None,
                 quantity=0, filled_price=None, filled_qty=0,
-                order_id=f"sim-close-{int(time.time())}",
+                order_id="sim-close-%d" % int(time.time()),
                 status=OrderStatus.FILLED, latency_ms=0,
                 details={"simulated": True},
             )
-            # In simulation mode, also remove from state on close
             _remove_persisted_position(symbol)
+            return res
+
+        if not (self._client and self._connected):
+            detail = ("broker not connected"
+                      if self._client else "broker client not initialised")
+            logger.error(
+                "REFUSING to close %s: live intent but %s. The position may "
+                "still be OPEN at the broker -- not marking it closed.",
+                symbol, detail)
+            return ExecutionResult(
+                success=False, symbol=symbol, side=None, quantity=0,
+                filled_price=None, filled_qty=0, order_id=None,
+                status=OrderStatus.ERROR, latency_ms=0,
+                error="Broker unavailable: %s" % detail,
+                details={"refused_no_broker": True, "confirmed_flat": False},
+            )
+
+        # The simulated branch that used to sit at the end of this function is
+        # now handled at the top, gated on `_simulate` rather than on
+        # connectivity. Reaching it via `else` meant a disconnected LIVE
+        # broker reported a successful close it never submitted.
+        try:
+            closed = self._client.close_position(symbol)
+            # close_position only SUBMITS a liquidating order. Treating it as
+            # filled -- and dropping local state -- would strand a live
+            # position if it does not fill. Confirm flatness first.
+            confirmed_flat = False
+            try:
+                confirmed_flat = self.get_position_strict(symbol) is None
+            except Exception as probe_error:
+                logger.warning(
+                    "Could not confirm %s is flat after close: %s",
+                    symbol, probe_error,
+                )
+            if not confirmed_flat:
+                logger.warning(
+                    "Close for %s SUBMITTED but not confirmed flat. Reporting "
+                    "failure so the caller does not record a completed trade; "
+                    "reconciliation will resolve it.", symbol)
+            res = ExecutionResult(
+                # success == the broker confirmed the position is gone.
+                # Anything less is an unresolved exit, not a closed trade.
+                success=bool(confirmed_flat), symbol=symbol, side=None,
+                quantity=0, filled_price=None, filled_qty=0,
+                order_id=closed.id if hasattr(closed, 'id') else None,
+                status=OrderStatus.FILLED if confirmed_flat else OrderStatus.PENDING,
+                latency_ms=0,
+                details={"confirmed_flat": confirmed_flat,
+                         "close_submitted": True},
+            )
+            # Only forget the position once the broker confirms it is gone.
+            if confirmed_flat:
+                _remove_persisted_position(symbol)
+        except Exception as e:
+            res = ExecutionResult(
+                success=False, symbol=symbol, side=None,
+                quantity=0, filled_price=None, filled_qty=0,
+                order_id=None, status=OrderStatus.ERROR, latency_ms=0,
+                error=str(e),
+            )
 
         _audit("order_close", {
             "symbol": symbol, "success": res.success,
@@ -1137,11 +1219,30 @@ class TradingEngine:
                 from execution_safety import (
                     BrokerExecutionAdapter, ExecutionSafety, PositionTruth,
                 )
-                ledger = os.environ.get(
-                    "EXECUTION_LEDGER_PATH",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "data", "execution_ledger.json"),
-                )
+                # The order ledger belongs in the environment-segregated data
+                # directory, like every other store. It defaulted to
+                # `backend/data/execution_ledger.json` -- inside the source
+                # tree, identical for paper and live -- so the two would have
+                # shared one order history, silently, contradicting the
+                # segregation guarantee everything else honours. Nothing set
+                # EXECUTION_LEDGER_PATH outside the tests, so that hardcoded
+                # path was the one in use.
+                ledger = os.environ.get("EXECUTION_LEDGER_PATH")
+                if not ledger:
+                    ledger = os.path.join(resolve_data_dir(),
+                                          "execution_ledger.json")
+                    # Moving a default orphans whatever the old one holds.
+                    # Say so rather than leaving real order history stranded
+                    # in a directory nothing reads any more.
+                    legacy = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "data", "execution_ledger.json")
+                    if os.path.exists(legacy) and legacy != ledger:
+                        logger.warning(
+                            "An execution ledger exists at the OLD default "
+                            "%s. It is no longer read. If it holds real "
+                            "orders, move it to %s before trading.",
+                            legacy, ledger)
                 safety = ExecutionSafety(ledger)
                 self._position_truth = PositionTruth(
                     safety, BrokerExecutionAdapter(self.broker))
@@ -1513,18 +1614,39 @@ class TradingEngine:
             )
 
         exit_key = "exit:%s:%s:%d" % (symbol, reason, int(time.time() * 1000))
-        held_qty = 0
+        # Keep the SIGN. A position's quantity is negative when short, and that
+        # sign is the only thing that says which way the exit goes: closing a
+        # long is a SELL, closing a short is a BUY. `abs()` here threw that
+        # away and the exit was registered as `side="sell"` unconditionally,
+        # so every short exit went into the ledger backwards -- the same
+        # direction-blindness that made the learner invert every short trade.
+        signed_qty = 0
+        position_known = False
         try:
             position = self.broker.get_position(symbol) or {}
-            held_qty = abs(int(float(position.get("qty", 0) or 0)))
-        except Exception:
-            held_qty = 0
+            signed_qty = int(float(position.get("qty", 0) or 0))
+            position_known = True
+        except Exception as exc:
+            logger.warning(
+                "Could not read %s position before exit (%s). Direction is "
+                "unknown; recording the ledger side conservatively.",
+                symbol, exc)
+
+        held_qty = abs(signed_qty)
+        # Short positions are closed by buying. When the position could not be
+        # read we cannot know, so assume the common case and say so in the log
+        # rather than recording a confident wrong answer silently.
+        exit_side = "buy" if signed_qty < 0 else "sell"
+        if not position_known:
+            logger.warning(
+                "Exit for %s registered as '%s' without confirming direction.",
+                symbol, exit_side)
 
         if safety is not None:
             try:
                 safety.register_exit(
                     client_order_key=exit_key, symbol=symbol,
-                    side="sell", quantity=max(1, held_qty),
+                    side=exit_side, quantity=max(1, held_qty),
                 )
             except Exception as exc:
                 logger.error(

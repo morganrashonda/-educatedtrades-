@@ -1,20 +1,17 @@
-# Educated Trades — Backend Dependencies
-# Generated 2026-07-04. Pin everything for reproducible builds.
+# Educated Trades — backend dependencies. Pinned for reproducible builds.
+#
+# Only what the code actually imports. The previous list pinned pandas, scipy,
+# Flask, flask-cors, finnhub-python, websocket-client, websockets and
+# python-dotenv — none of which appear in any import statement. scipy alone
+# requires Python 3.10+, so an unused dependency was breaking installation on
+# 3.9 for no benefit.
 
-numpy==1.26.4
-pandas==2.2.3
-scipy==1.14.1
-requests==2.32.3
-Flask==3.1.0
-flask-cors==5.0.0
-alpaca-py==0.43.0
-finnhub-python==2.4.29
-# Sentiment scoring. Without this the engine silently degrades to keyword-only
-# matching -- it still runs, but VADER contributes 0.0 to every conviction.
-vaderSentiment==3.3.2
-websocket-client==1.8.0
-websockets==12.0
-python-dotenv==1.0.1
+numpy==1.26.4           # patterns.py — indicator maths
+alpaca-py==0.43.0       # trading.py, main.py — broker client
+requests==2.32.3        # news_ingestion.py — Finnhub REST calls
+vaderSentiment==3.3.2   # sentiment.py — retained for news telemetry only;
+                        # sentiment no longer contributes to the signal path
 
-# Testing
+# Testing. The two primary suites (test_suite.py, test_end_to_end.py) are
+# stdlib-only and need nothing installed; pytest is for the older tests.
 pytest>=7.4.0

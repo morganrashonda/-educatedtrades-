@@ -59,6 +59,64 @@ def init_alert_db() -> None:
     _get_connection()
 
 
+#: Alerts at or above this level are pushed off the machine.
+_ESCALATE = frozenset({"critical", "error"})
+#: Do not send the same alert type more often than this (seconds). One
+#: repeating fault should not produce a message every cycle -- that is how an
+#: alert channel becomes something you mute, which is worse than no alerts.
+_REPEAT_S = int(os.environ.get("ALERT_REPEAT_SECONDS", "900"))
+_last_sent: dict = {}
+_notify_guard = threading.Lock()
+
+
+def _webhook_url() -> str:
+    """Where critical alerts go. Falls back to the watchdog's webhook."""
+    return (os.environ.get("ALERT_WEBHOOK_URL", "")
+            or os.environ.get("WATCHDOG_DISCORD_WEBHOOK", "")).strip()
+
+
+def _push(level: str, alert_type: str, message: str) -> None:
+    """POST an alert to the webhook. Runs on its own thread; never raises.
+
+    Deliberately fire-and-forget on a daemon thread. A blocking network call
+    in the alerting path would put the trading loop at the mercy of Discord's
+    availability -- and the moment you most need an alert is the moment
+    something is already wrong, which is the worst time to add a new way to
+    hang.
+    """
+    url = _webhook_url()
+    if not url:
+        return
+    try:
+        import json as _json
+        import urllib.request
+
+        text = "**%s** `%s`\n%s" % (level.upper(), alert_type, message[:1500])
+        payload = _json.dumps({"content": text}).encode("utf-8")
+        request = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(request, timeout=10).close()
+    except Exception as exc:                      # noqa: BLE001
+        # An unreachable webhook must never break the caller. The alert is
+        # already in the database; this is the redundant copy.
+        logger.warning("Could not push %s alert off-machine: %s", level, exc)
+
+
+def _maybe_escalate(level: str, alert_type: str, message: str) -> None:
+    """Send critical and error alerts off the machine, debounced per type."""
+    if str(level).lower() not in _ESCALATE:
+        return
+    now = time.time()
+    with _notify_guard:
+        last = _last_sent.get(alert_type, 0.0)
+        if now - last < _REPEAT_S:
+            return
+        _last_sent[alert_type] = now
+    threading.Thread(target=_push, args=(level, alert_type, message),
+                     daemon=True).start()
+
+
 def insert_alert(alert_type: str, message: str, level: str = "info") -> None:
     """
     Insert a single alert row.
@@ -82,6 +140,10 @@ def insert_alert(alert_type: str, message: str, level: str = "info") -> None:
         logger.debug("Alert written to %s: [%s] %s", DB_PATH, level, alert_type)
     except Exception as e:
         logger.error("Failed to write alert to %s: %s", DB_PATH, e)
+    finally:
+        # In `finally` on purpose: if the DATABASE write failed, that is
+        # exactly when you most want the alert to leave the machine.
+        _maybe_escalate(level, alert_type, message)
 
 
 def get_recent_alerts(limit: int = 20) -> list:

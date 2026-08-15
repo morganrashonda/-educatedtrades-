@@ -129,10 +129,19 @@ place trades.
 ## Dashboard (optional)
 
 ```bash
-cd site
 bun install
 bun run dev      # http://localhost:3000
 ```
+
+The dashboard talks to the bot **server-to-server**, so `API_AUTH_TOKEN` must be
+exported in whatever shell runs it. The token stays on the server; the browser
+never sees it.
+
+That design has a consequence worth stating plainly: the dashboard has **no
+login of its own**. It authenticates to the bot on behalf of whoever loads the
+page. So it binds `127.0.0.1` by default, and `DASHBOARD_HOST` should be widened
+only behind a firewall or an authenticating proxy. Anything that can reach this
+port can engage the kill switch.
 
 ---
 

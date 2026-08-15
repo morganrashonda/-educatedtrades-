@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Moon, Loader2, AlertCircle } from "lucide-react";
-import { getOvernightRisk } from "../server/api";
+import { Moon, Loader2 } from "lucide-react";
+import { fetchOvernightRisk } from "../server/actions";
 
 export function OvernightRisk() {
   const [data, setData] = useState<any | null>(null);
@@ -9,7 +9,7 @@ export function OvernightRisk() {
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
-      const result = await getOvernightRisk();
+      const result = await fetchOvernightRisk();
       setData(result);
       setLoading(false);
     };

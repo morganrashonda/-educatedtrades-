@@ -1,10 +1,46 @@
 import type { Portfolio, Signal, Trade, Alert, Milestone, PatternSummary } from '../types';
 
-const API_BASE = 'http://localhost:3099/api';
+const API_BASE = process.env.BOT_API_BASE ?? 'http://127.0.0.1:3099/api';
+
+/**
+ * This module is SERVER-ONLY. It holds the bot's API token.
+ *
+ * The backend requires `Authorization: Bearer $API_AUTH_TOKEN` on every
+ * endpoint, and that API can change mode and place trades. Sending the header
+ * from a browser component would put the token in the client bundle, readable
+ * by anyone who loads the page -- a strictly worse outcome than the 401s it
+ * would fix. So every call here runs on the server, and client components
+ * reach it only through `createServerFn` wrappers.
+ *
+ * The guard below turns a mistake into a loud failure instead of a silent
+ * credential leak: if this module is ever evaluated in a browser, it throws.
+ */
+if (typeof window !== 'undefined') {
+  throw new Error(
+    'server/api.ts was imported into client code. It holds the bot API token ' +
+    'and must only run on the server. Call it through a createServerFn wrapper.'
+  );
+}
+
+const API_TOKEN = process.env.API_AUTH_TOKEN ?? '';
+if (!API_TOKEN) {
+  console.warn(
+    '[api] API_AUTH_TOKEN is not set. Every backend request will return 401. ' +
+    'Export it in the environment that runs the dashboard server.'
+  );
+}
+
+/** Headers for every backend call. Auth is not optional -- the API fails closed. */
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    Authorization: `Bearer ${API_TOKEN}`,
+    ...(extra ?? {}),
+  };
+}
 
 export async function getSystemStatus() {
   try {
-    const response = await fetch(`${API_BASE}/status`);
+    const response = await fetch(`${API_BASE}/status`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -15,7 +51,7 @@ export async function getSystemStatus() {
 
 export async function getPortfolio() {
   try {
-    const response = await fetch(`${API_BASE}/portfolio`);
+    const response = await fetch(`${API_BASE}/portfolio`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -26,7 +62,7 @@ export async function getPortfolio() {
 
 export async function getLatestSentiment() {
   try {
-    const response = await fetch(`${API_BASE}/sentiment/latest`);
+    const response = await fetch(`${API_BASE}/sentiment/latest`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -37,7 +73,7 @@ export async function getLatestSentiment() {
 
 export async function getPatternSummary() {
   try {
-    const response = await fetch(`${API_BASE}/patterns/top`);
+    const response = await fetch(`${API_BASE}/patterns/top`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -48,7 +84,7 @@ export async function getPatternSummary() {
 
 export async function getRecentTrades() {
   try {
-    const response = await fetch(`${API_BASE}/trades/recent`);
+    const response = await fetch(`${API_BASE}/trades/recent`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     const data = await response.json();
     return data.trades || [];
@@ -60,7 +96,7 @@ export async function getRecentTrades() {
 
 export async function getRecentAlerts(): Promise<Alert[]> {
   try {
-    const response = await fetch(`${API_BASE}/alerts/recent`);
+    const response = await fetch(`${API_BASE}/alerts/recent`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     const data = await response.json();
     return data.alerts || [];
@@ -72,7 +108,7 @@ export async function getRecentAlerts(): Promise<Alert[]> {
 
 export async function getMilestoneData() {
   try {
-    const response = await fetch(`${API_BASE}/milestones`);
+    const response = await fetch(`${API_BASE}/milestones`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -83,7 +119,7 @@ export async function getMilestoneData() {
 
 export async function getHeartbeat() {
   try {
-    const response = await fetch(`${API_BASE}/heartbeat`);
+    const response = await fetch(`${API_BASE}/heartbeat`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -94,7 +130,7 @@ export async function getHeartbeat() {
 
 export async function getOvernightRisk() {
   try {
-    const response = await fetch(`${API_BASE}/risk/overnight`);
+    const response = await fetch(`${API_BASE}/risk/overnight`, { headers: authHeaders() });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
@@ -107,6 +143,7 @@ export async function triggerKillSwitch() {
   try {
     const response = await fetch(`${API_BASE}/kill`, {
       method: 'POST',
+      headers: authHeaders(),
     });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
@@ -118,8 +155,9 @@ export async function triggerKillSwitch() {
 
 export async function resetKillSwitch() {
   try {
-    const response = await fetch(`${API_BASE}/reset-kill`, {
+    const response = await fetch(`${API_BASE}/reset`, {
       method: 'POST',
+      headers: authHeaders(),
     });
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
@@ -133,7 +171,7 @@ export async function setOrchestratorMode(mode: 'manual' | 'autonomous' | 'stopp
   try {
     const response = await fetch(`${API_BASE}/mode`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ mode })
     });
     if (!response.ok) throw new Error('API request failed');

@@ -586,7 +586,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # Authorization must be allowed or a cross-origin preflight rejects
+        # every authenticated request before it is sent. The dashboard now
+        # calls this server-to-server (no CORS involved), but anything that
+        # does call from a browser would otherwise fail at preflight with no
+        # useful error.
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
 
@@ -853,13 +859,45 @@ class Orchestrator:
             logger.warning("Could not load operator mode file: %s", e)
 
     def _save_persisted_mode(self) -> None:
-        """No-op: the bot NEVER writes to the operator mode file.
+        """Persist the operator's mode. Called ONLY from set_mode().
 
-        The orchestrator_mode.txt file is operator-owned.  Kill mechanisms
-        write to KILLED_STATE_FILE instead.  Only the operator (or an
-        operator-initiated API call) may write the mode file.
+        The mode file is operator-owned, and this is the operator's own
+        action arriving through the API -- so writing it here is the intended
+        behaviour, not a violation of that ownership. Automated demotions
+        (kill switch, daily loss limit, health failure) must NEVER call this:
+        they set state flags and write KILLED_STATE_FILE, so the file keeps
+        the pre-halt mode and the bot can resume it on the next day rollover.
+
+        This was a `pass` stub whose docstring asserted the bot never writes
+        the file, while permitting exactly this call in the same sentence.
+        The effect was that POST /api/mode changed the mode in memory only,
+        and every restart silently reverted to MANUAL -- including systemd's
+        Restart=always after a crash. The bot would come back, pass preflight,
+        cycle normally, and never trade again, announcing nothing.
+
+        Observed in production: autonomous set at 09:45, process restarted at
+        10:30, then a full afternoon of cycles in MANUAL with an empty
+        decision journal. It presented exactly like a broken signal path.
+        docs/MODE_PRECEDENCE.md had documented this as working throughout.
+
+        Written atomically: a torn mode file read at startup is a bot whose
+        operating state is decided by a partial write.
         """
-        pass
+        try:
+            os.makedirs(os.path.dirname(MODE_FILE) or ".", exist_ok=True)
+            tmp = "%s.tmp.%d" % (MODE_FILE, os.getpid())
+            with open(tmp, "w") as handle:
+                handle.write(self.state.mode.value + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, MODE_FILE)
+            logger.info("Operator mode persisted: %s", self.state.mode.value)
+        except OSError as exc:
+            # Never let this break the mode change itself -- the in-memory
+            # switch has already happened and the operator asked for it.
+            logger.error(
+                "Could not persist operator mode to %s: %s. The mode is "
+                "active now but will NOT survive a restart.", MODE_FILE, exc)
 
     @property
     def clock(self):
@@ -1781,9 +1819,28 @@ class Orchestrator:
         return regime_info
 
 
-    def _fetch_ohlc(self, symbol: str, bars: int = 75) -> Optional[dict]:
-        """
-        Fetch recent OHLC bars for a symbol at the configured timeframe.
+    def _fetch_ohlc(self, symbol: str,
+                    bars: int = INDICATOR_FETCH_BARS) -> Optional[dict]:
+        """Fetch bars. The DEFAULT matters: it decides what the bot trades on.
+
+        This defaulted to 75. Four call sites use it, and only the one that
+        produces the visible INDICATOR log lines passed an explicit
+        INDICATOR_FETCH_BARS. The signal path -- `_run_pipeline_cycle`,
+        which computes the EMA-20/EMA-50 pair that decides trend direction --
+        took the default and therefore computed EMAs from 75 bars.
+
+        Measured on realistic price series, EMA-50 from 75 bars disagrees with
+        EMA-50 from 200 bars by up to 0.35%, which is half the 0.693% stop
+        distance. The magnitude is not the real problem: trend direction is
+        decided by whether EMA-20 is above or below EMA-50, and an error that
+        size can FLIP that comparison. The bot would read an uptrend as a
+        downtrend while the log showed the correct, 200-bar values.
+
+        This is the same defect fixed earlier in the indicator path. Fixing
+        one call site and leaving the default wrong meant the numbers being
+        logged and the numbers being traded on came from different histories.
+        The default is now the correct value, so a new call site inherits
+        correctness instead of inheriting the bug.
 
         Live/paper: pulls real bars from Alpaca's market-data API.
         Returns {"highs":[...],"lows":[...],"closes":[...]} or None on failure.
@@ -2439,9 +2496,16 @@ class Orchestrator:
 
             # Restore mode from persistence on day rollover.
             # For DAILY_LOSS_LIMIT, the mode file still holds the pre-halt mode
-            # (e.g. AUTONOMOUS) since _save_persisted_mode() is only called from
-            # set_mode(), not from the loss-limit trigger. For all other modes the
-            # file matches the current mode, so this is a no-op restore.
+            # (e.g. AUTONOMOUS), because the loss-limit trigger sets
+            # state.mode directly and never calls _save_persisted_mode().
+            # Only set_mode() -- the operator's own action -- writes the file.
+            # For all other modes the file matches the current mode, so this is
+            # a no-op restore.
+            #
+            # This comment previously claimed _save_persisted_mode() was "only
+            # called from set_mode()". It was called from the Tier 2 evaluation
+            # loop and NOT from set_mode(), so the file was never written by an
+            # operator mode change and this restore had nothing to read.
             if was_halted:
                 self._load_persisted_mode()
                 logger.info(
@@ -2686,6 +2750,22 @@ class Orchestrator:
         old_mode = self.state.mode
         self.state.mode = new_mode
 
+        # Persist BEFORE acting on the change. The operator's intent is the
+        # thing that must survive; if the process dies during start()/stop()
+        # below, the file should already reflect what was asked for.
+        #
+        # This call was missing entirely. set_mode() changed the mode in
+        # memory only, so every restart silently reverted to MANUAL --
+        # including systemd's Restart=always after a crash. The bot would
+        # come back up, log PREFLIGHT PASSED, cycle normally, and never trade
+        # again, with nothing announcing that it had stopped.
+        #
+        # Observed: autonomous set at 09:45, restarted at 10:30, then a full
+        # afternoon of cycles in MANUAL and an empty decision journal. It
+        # looked like a broken signal path and was a lost setting.
+        #
+        # docs/MODE_PRECEDENCE.md already documented this as working.
+        self._save_persisted_mode()
 
         if new_mode == OrchestratorMode.STOPPED:
             self.stop()
@@ -3328,15 +3408,37 @@ class Orchestrator:
                     # Record pattern entry and track position
                     if exec_result.success and exec_result.filled_price:
                         try:
-                            # Compute real EMA values from recent daily bars
-                            try:
-                                _bars = self.patterns.db.get_recent_daily_bars(symbol, limit=50)
-                                _closes = [b["close"] for b in _bars]
-                                _ema_short = self._compute_ema(_closes, 20) if _closes else 0.0
-                                _ema_long = self._compute_ema(_closes, 50) if _closes else 0.0
-                            except Exception:
-                                _ema_short = 0.0
-                                _ema_long = 0.0
+                            # The signature must describe the trade that was
+                            # actually made. These EMAs were recomputed from
+                            # `daily_bars` -- a different dataset, at a
+                            # different resolution, capped at 50 rows, and
+                            # stale because the reconciliation writer was
+                            # rejecting every bar. The DECISION used the live
+                            # indicators from _fetch_ohlc. So the learner was
+                            # keyed on numbers the decision never saw, which
+                            # is the same failure as recording P&L with the
+                            # wrong sign: the record does not describe reality.
+                            #
+                            # Use the values the decision used. Fall back to
+                            # recomputation only if they are missing, and say
+                            # so, rather than silently substituting 0.0.
+                            _ind = (self.state.live_indicators or {}).get(symbol) or {}
+                            _ema_short = _ind.get("ema_short")
+                            _ema_long = _ind.get("ema_long")
+                            if _ema_short is None or _ema_long is None:
+                                logger.warning(
+                                    "Pattern signature for %s has no live EMAs; "
+                                    "falling back to stored bars. The signature "
+                                    "may not match the decision.", symbol)
+                                try:
+                                    _bars = self.patterns.db.get_recent_daily_bars(
+                                        symbol, limit=INDICATOR_FETCH_BARS)
+                                    _closes = [b["close"] for b in _bars]
+                                    _ema_short = self._compute_ema(_closes, EMA_SHORT_PERIOD) if _closes else 0.0
+                                    _ema_long = self._compute_ema(_closes, EMA_LONG_PERIOD) if _closes else 0.0
+                                except Exception:
+                                    _ema_short = 0.0
+                                    _ema_long = 0.0
                             rid, phash = self.patterns.record_trade_pattern_and_track(
                                 symbol=symbol,
                                 sentiment_score=0.0,
@@ -3564,7 +3666,12 @@ class Orchestrator:
                     json.dump(audit_data, f, indent=2)
             self.state.tier_2_eval_cycle += 1
             logger.info("Tier 2 evaluation cycle %d complete", self.state.tier_2_eval_cycle)
-            self._save_persisted_mode()
+            # _save_persisted_mode() was called here. It was harmless while
+            # that function was a no-op stub; once implemented it would
+            # persist whatever mode happened to be current -- including an
+            # automated DAILY_LOSS_LIMIT demotion, which would overwrite the
+            # pre-halt mode that day-rollover recovery reads back. Only
+            # set_mode(), the operator's own action, may write that file.
         except Exception as e:
             logger.error("Tier 2 evaluation FAILED: %s", e)
 
@@ -4140,9 +4247,19 @@ class Orchestrator:
                             or ohlc["opens"][-1] is None or ohlc["volumes"][-1] is None):
                         logger.warning("Reconciliation skipped %s: missing real timestamp/open/volume", sym)
                         continue
+                    # store_daily_bar validates with date.fromisoformat, which
+                    # accepts YYYY-MM-DD only. This passed a full timestamp --
+                    # "2026-08-14T19:30:00+00:00" -- so EVERY bar was rejected
+                    # as malformed and daily_bars never updated after the
+                    # one-time backfill. The backfill path two thousand lines
+                    # up already normalises to a date; this one did not.
+                    _bar_ts = ohlc["bar_dates"][-1]
+                    _bar_date = (_bar_ts.astimezone(timezone.utc).date()
+                                 if getattr(_bar_ts, "tzinfo", None)
+                                 else _bar_ts.date())
                     self.patterns.db.store_daily_bar(
                         symbol=sym,
-                        date_str=ohlc["bar_dates"][-1].isoformat(),
+                        date_str=str(_bar_date),
                         open_p=ohlc["opens"][-1],
                         high=ohlc["highs"][-1],
                         low=ohlc["lows"][-1],

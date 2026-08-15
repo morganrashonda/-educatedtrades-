@@ -16,49 +16,33 @@ import { DrawdownDisplay } from "../components/DrawdownDisplay";
 import { QuickStats } from "../components/QuickStats";
 import { StatusBar } from "../components/StatusBar";
 import { SkeletonCard, SkeletonTable, SkeletonChart } from "../components/SkeletonCard";
-import { 
-  getDashboardData as getRealDashboardData, 
+// Server-only: this module holds the bot API token and throws if evaluated in
+// a browser. Both symbols below are used exclusively inside createServerFn
+// handlers, which run on the server. triggerKillSwitch/resetKillSwitch were
+// imported here and never used -- dead imports that still pulled a
+// token-bearing module into the client graph. The kill switch reaches the API
+// through ../server/actions instead.
+import {
+  getDashboardData as getRealDashboardData,
   setOrchestratorMode,
-  triggerKillSwitch,
-  resetKillSwitch
 } from "../server/api";
-import { 
-  LayoutDashboard, 
-  Settings, 
-  Bell, 
-  Search, 
-  User, 
-  Activity, 
-  Zap, 
+import {
+  LayoutDashboard,
+  Settings,
+  Bell,
+  Search,
+  User,
+  Activity,
+  Zap,
   X,
-  CheckCircle2,
   AlertCircle,
   TrendingUp,
-  Award,
   Shield,
-  ShieldOff,
   BarChart3,
   Menu,
-  ChevronRight,
-  RefreshCw,
-  Terminal,
   BookOpen,
   Signal,
-  DollarSign,
-  Clock,
-  ArrowUpRight,
-  ArrowDownRight,
-  AlertTriangle,
-  Heart,
-  Moon,
-  Target,
-  Brain,
-  TrendingDown,
-  Gauge,
   Bot,
-  Eye,
-  ExternalLink,
-  Layers,
   LogOut,
   Settings2,
   HelpCircle,

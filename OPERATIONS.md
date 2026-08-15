@@ -269,6 +269,84 @@ No pytest, no dependencies. The end-to-end suite wires the real objects
 together with only the broker SDK stubbed — it exists because unit tests cannot
 catch code that is correct but unreachable, which happened three times here.
 
+## The web dashboard and the API token
+
+The backend requires a bearer token on every endpoint; the frontend sent no
+`Authorization` header at all, so every request returned 401. It also called
+`/api/reset-kill`, which the backend does not implement.
+
+**The obvious fix would have been worse than the bug.** Adding the header to
+`server/api.ts` looks right until you notice that three *client* components
+imported that module directly. The token would then have been bundled into the
+browser — readable by anyone who loads the page, on an API that can change mode
+and place trades. Trading 401s for a published credential is a bad trade.
+
+So the fix is architectural rather than a header:
+
+- `server/api.ts` is **server-only** and throws if evaluated in a browser, so a
+  future mistake fails loudly instead of leaking silently.
+- The token comes from `process.env.API_AUTH_TOKEN`, never a literal.
+- Client components reach the API through `createServerFn` wrappers in
+  `server/actions.ts`. The browser talks to the dashboard server; the dashboard
+  server holds the token and talks to the bot over loopback.
+- CORS never applies, because the call is server-to-server. `Authorization` was
+  added to the allowed headers anyway, so anything that *does* call from a
+  browser fails with a real error rather than at preflight.
+
+`FE-1`–`FE-9` cover this, including a check that no client component imports the
+token-bearing module, and a vacuity check so "all calls authenticated" cannot
+pass by finding zero calls. Six negative controls confirm each check fires.
+
+Two dashboards exist: `src/` (current) and `site/` (an older copy). The README
+points at `site/`. The terminal dashboard — `scripts/dashboard.py`, no Node
+required — supersedes both.
+
+## Broker failure
+
+The most dangerous defects in this codebase were not in the happy path. They
+were in what happens when the broker is unreachable — code that only runs when
+something has already gone wrong, which is why it survived review.
+
+**A disconnected live broker used to fabricate fills.** `execute_order`
+dispatched on *connectivity* — `if connected: live else: simulated` — so a
+live broker whose connection dropped fell through to the simulated branch and
+returned an invented fill, while the audit record said `"mode": "live"`. The
+system would hold a position the broker never received, with P&L, learning
+data and slippage computed from a price nobody traded at. A DNS outage during
+an order is enough, and one occurred in production on the first live day.
+
+`close_position` had the same shape with a worse consequence: a phantom close
+that dropped tracking while real exposure remained open and unmonitored.
+
+Simulation is now a **mode you choose**, never a fallback. Live intent with no
+broker refuses (`BR-1`–`BR-8`).
+
+**`success` on a close now means confirmed flat.** It used to be `True`
+regardless, with only `status` distinguishing FILLED from PENDING — and every
+caller keys on `.success`, so an unconfirmed close was recorded as a completed
+trade. An unconfirmed submission now returns `success=False` with
+`close_submitted` set, so reconciliation resolves it instead of the caller
+assuming it is done (`BR-9`–`BR-11`).
+
+**Exit side follows the position.** `register_exit` was called with
+`side="sell"` unconditionally, so every short exit went into the ledger
+backwards — the same direction-blindness that made the learner invert every
+short trade, in a different file. The signed quantity is now preserved and the
+side derived from it (`XS-1`–`XS-3`).
+
+**The order ledger is environment-segregated.** It defaulted to
+`backend/data/execution_ledger.json` — inside the source tree, identical for
+paper and live — and nothing set `EXECUTION_LEDGER_PATH` outside the tests, so
+that path was the one in use. Paper and live would have shared one order
+history. It now routes through the same derivation as every other store, and
+warns if a ledger is left at the old location rather than silently orphaning
+it (`LP-1`–`LP-4`).
+
+All four have negative controls that reintroduce the original code and confirm
+the checks fail. The first one took two attempts: the initial mutation
+replaced the wrong branch and fell through to the refusal, so the control
+passed while testing nothing.
+
 ## Concurrency
 
 Three threads run against shared state: the pipeline, the 15-second position

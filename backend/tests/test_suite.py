@@ -36,6 +36,7 @@ _SUITE_START = __import__("time").time()
 _PROBE_DIAGNOSTICS = []
 
 from collections import Counter
+import re as _re
 RESULTS = []
 
 
@@ -4928,6 +4929,571 @@ chk("EL-7 an exit does not delay re-entry",
 chk("EL-8 an unresolved entry is visible to the exposure check",
     _el_safety.has_open_exposure("SPY", "buy") in (True, False),
     "queryable", "no exception")
+
+
+# --- BF. Bar-count consistency: the log and the trade must agree -----------
+# `_fetch_ohlc` defaulted to 75 bars. Four call sites use it; only the one
+# producing the visible INDICATOR lines passed INDICATOR_FETCH_BARS
+# explicitly. The SIGNAL path took the default, so the EMA-20/EMA-50 pair
+# that decides trend direction was computed from 75 bars while the log showed
+# values computed from 200.
+#
+# Measured: EMA-50 from 75 bars disagrees with EMA-50 from 200 bars by up to
+# 0.35% — half the 0.693% stop distance, and enough to FLIP the crossover
+# that decides long versus short.
+#
+# This was the same defect already fixed once in the indicator path. Fixing
+# one call site and leaving the default wrong is why it survived: a default
+# is inherited silently by everything that does not override it.
+_bf_tree = _ast.parse(open(os.path.join(BACKEND, "main.py"),
+                           encoding="utf-8").read())
+_bf_default = None
+for _node in _ast.walk(_bf_tree):
+    if isinstance(_node, _ast.FunctionDef) and _node.name == "_fetch_ohlc":
+        _bf_default = _node.args.defaults[-1] if _node.args.defaults else None
+
+chk("BF-1 _fetch_ohlc has a default bar count", _bf_default is not None)
+chk("BF-2 the default is not a bare literal",
+    not isinstance(_bf_default, _ast.Constant),
+    _ast.unparse(_bf_default) if _bf_default else None,
+    "INDICATOR_FETCH_BARS")
+chk("BF-3 the default is the same constant the indicator path uses",
+    _bf_default is not None
+    and _ast.unparse(_bf_default) == "INDICATOR_FETCH_BARS",
+    _ast.unparse(_bf_default) if _bf_default else None,
+    "INDICATOR_FETCH_BARS")
+
+# Any explicit override must still be enough for the longest EMA, or that
+# call site quietly recreates the bug with a different number.
+_bf_calls = []
+for _node in _ast.walk(_bf_tree):
+    if (isinstance(_node, _ast.Call)
+            and isinstance(_node.func, _ast.Attribute)
+            and _node.func.attr == "_fetch_ohlc"):
+        for _kw in _node.keywords:
+            if _kw.arg == "bars":
+                _bf_calls.append(_ast.unparse(_kw.value))
+chk("BF-4 every explicit bar count is a named constant, not a magic number",
+    all(not _v.isdigit() for _v in _bf_calls), _bf_calls, "named constants")
+
+# The numeric relationship that makes all of this correct.
+chk("BF-5 the fetch count clears the longest indicator period with margin",
+    _main.INDICATOR_FETCH_BARS >= _main.EMA_LONG_PERIOD * 3,
+    (_main.INDICATOR_FETCH_BARS, _main.EMA_LONG_PERIOD),
+    "fetch >= 3x the longest period")
+
+# Negative control: prove the check would catch a reverted default.
+_bf_broken = _ast.parse("def _fetch_ohlc(self, symbol, bars=75): pass")
+_bf_bad = _bf_broken.body[0].args.defaults[-1]
+chk("BF-6 a literal default would be caught (negative control)",
+    isinstance(_bf_bad, _ast.Constant))
+
+
+# --- PM. Operator mode must survive a restart ------------------------------
+# set_mode() changed state.mode in memory and never wrote the file, so every
+# restart silently reverted to MANUAL -- including systemd's Restart=always
+# after a crash. The bot would come back up, pass preflight, cycle normally,
+# and never trade again, with nothing announcing it had stopped.
+#
+# Observed in production: autonomous set at 09:45, process restarted at 10:30,
+# then an entire afternoon of cycles in MANUAL and an empty decision journal.
+# It looked exactly like a broken signal path. docs/MODE_PRECEDENCE.md had
+# documented this as working the whole time.
+_pm_dir = tempfile.mkdtemp()
+_pm_prev_dd = os.environ.get("DATA_DIR")
+os.environ["DATA_DIR"] = _pm_dir
+_wd_il.reload(_main)
+
+
+def _pm_orch():
+    orch = _main.Orchestrator.__new__(_main.Orchestrator)
+    orch.state = _main.PipelineState()
+    orch._trading_engine = SimpleNamespace()
+    return orch
+
+
+_pm = _pm_orch()
+_pm.set_mode("autonomous")
+chk("PM-1 setting the mode writes the operator file",
+    os.path.exists(_main.MODE_FILE), _main.MODE_FILE, "exists")
+chk("PM-2 the file records what was asked for",
+    open(_main.MODE_FILE).read().strip() == "autonomous",
+    open(_main.MODE_FILE).read().strip() if os.path.exists(_main.MODE_FILE) else None,
+    "autonomous")
+
+# A fresh process must come back autonomous, not silently MANUAL.
+_pm_restarted = _pm_orch()
+_pm_restarted._load_persisted_mode()
+chk("PM-3 a restart restores the operator's mode",
+    _pm_restarted.state.mode is _main.OrchestratorMode.AUTONOMOUS,
+    _pm_restarted.state.mode, _main.OrchestratorMode.AUTONOMOUS)
+
+_pm.set_mode("manual")
+_pm_again = _pm_orch()
+_pm_again._load_persisted_mode()
+chk("PM-4 switching back is persisted too",
+    _pm_again.state.mode is _main.OrchestratorMode.MANUAL,
+    _pm_again.state.mode, _main.OrchestratorMode.MANUAL)
+
+# The docs promised this behaviour before the code did it.
+_pm_doc = open(os.path.join(os.path.dirname(BACKEND), "docs",
+                            "MODE_PRECEDENCE.md"), encoding="utf-8").read()
+# Only the operator's own action may write that file. An automated demotion
+# (kill switch, daily loss limit) must leave the pre-halt mode intact so the
+# day-rollover recovery can restore it. The Tier-2 loop used to call this --
+# harmless while the function was a no-op stub, a real bug once implemented.
+_pm_callers = []
+for _node in _ast.walk(_ast.parse(open(os.path.join(BACKEND, "main.py"),
+                                       encoding="utf-8").read())):
+    if isinstance(_node, _ast.FunctionDef):
+        for _sub in _ast.walk(_node):
+            if (isinstance(_sub, _ast.Call)
+                    and isinstance(_sub.func, _ast.Attribute)
+                    and _sub.func.attr == "_save_persisted_mode"):
+                _pm_callers.append(_node.name)
+chk("PM-6 only set_mode persists the operator mode",
+    _pm_callers == ["set_mode"], _pm_callers, ["set_mode"])
+
+chk("PM-5 the documented contract is the implemented one",
+    "orchestrator_mode.txt" in _pm_doc
+    and "_save_persisted_mode()" in open(
+        os.path.join(BACKEND, "main.py"), encoding="utf-8").read().split(
+            "def set_mode")[1].split("def ")[0],
+    "set_mode persists", "set_mode calls _save_persisted_mode")
+
+if _pm_prev_dd is None:
+    os.environ.pop("DATA_DIR", None)
+else:
+    os.environ["DATA_DIR"] = _pm_prev_dd
+_wd_il.reload(_main)
+
+
+# --- BR. Broker failure must never be answered with a fabricated fill ------
+# `execute_order` dispatched on CONNECTIVITY: `if self._client and
+# self._connected: live else: simulated`. A live broker whose connection
+# dropped -- `_simulate` still False -- therefore fell through and produced a
+# FABRICATED FILL, while the audit record said `"mode": "live"`. The system
+# would hold a position the broker never received, with P&L, learning data
+# and slippage all computed from a price nobody traded at.
+#
+# Two real states reach it: live initialisation failing, and reconnect()
+# failing. A DNS outage mid-order is enough, and one occurred in production.
+class _BRClient:
+    def __init__(self):
+        self.submitted = []
+
+    def submit_order(self, order_data):
+        self.submitted.append(order_data)
+        return SimpleNamespace(id="o1", status="filled", filled_qty=1,
+                               filled_avg_price=100.0, order_class="simple")
+
+    def close_position(self, symbol):
+        self.submitted.append(("close", symbol))
+        return SimpleNamespace(id="c1")
+
+    def get_open_position(self, symbol):
+        raise Exception("position does not exist")
+
+
+def _br_broker(simulate, connected, has_client=True):
+    b = trading.AlpacaBroker(simulate=True)
+    b._simulate = simulate
+    b._client = _BRClient() if has_client else None
+    b._connected = connected
+    return b
+
+
+_br_live_down = _br_broker(simulate=False, connected=False)
+_br_res = _br_live_down.execute_order(
+    symbol="SPY", side=trading.OrderSide.BUY, quantity=10)
+chk("BR-1 a disconnected live broker refuses rather than simulating",
+    _br_res.success is False, _br_res.success, False)
+chk("BR-2 it reports no fill at all",
+    _br_res.filled_qty == 0 and _br_res.filled_price is None,
+    (_br_res.filled_qty, _br_res.filled_price), (0, None))
+chk("BR-3 the refusal names the cause",
+    "Broker unavailable" in (_br_res.error or ""), _br_res.error,
+    "Broker unavailable...")
+chk("BR-4 nothing reached the broker",
+    _br_live_down._client.submitted == [],
+    _br_live_down._client.submitted, [])
+
+# No client at all -- the other way to be disconnected.
+_br_noclient = _br_broker(simulate=False, connected=False, has_client=False)
+chk("BR-5 an uninitialised client refuses too",
+    _br_noclient.execute_order(
+        symbol="SPY", side=trading.OrderSide.BUY, quantity=10).success is False)
+
+# Deliberate simulation must still work — this is a mode, not a failure.
+_br_sim = _br_broker(simulate=True, connected=False)
+chk("BR-6 chosen simulation still fills",
+    _br_sim.execute_order(
+        symbol="SPY", side=trading.OrderSide.BUY, quantity=10).success is True)
+
+# Closing has the same shape, and the worse consequence: a phantom close
+# drops tracking while real exposure remains.
+_br_close_down = _br_broker(simulate=False, connected=False)
+_br_close = _br_close_down.close_position("SPY")
+chk("BR-7 a disconnected live broker refuses to report a close",
+    _br_close.success is False, _br_close.success, False)
+chk("BR-8 it does not claim the position is flat",
+    (_br_close.details or {}).get("confirmed_flat") is False,
+    (_br_close.details or {}).get("confirmed_flat"), False)
+
+# success must mean CONFIRMED flat. It used to be True regardless, with only
+# `status` distinguishing FILLED from PENDING -- and every caller keys on
+# `.success`, so an unconfirmed close was recorded as a completed trade.
+class _BRStillOpen(_BRClient):
+    def get_open_position(self, symbol):
+        return SimpleNamespace(symbol=symbol, qty=10.0)
+
+
+_br_open = _br_broker(simulate=False, connected=True)
+_br_open._client = _BRStillOpen()
+_br_unconfirmed = _br_open.close_position("SPY")
+chk("BR-9 an unconfirmed close is not reported as success",
+    _br_unconfirmed.success is False, _br_unconfirmed.success, False)
+chk("BR-10 but the submission is recorded, so it can be reconciled",
+    (_br_unconfirmed.details or {}).get("close_submitted") is True)
+chk("BR-11 its status says PENDING, not FILLED",
+    _br_unconfirmed.status is trading.OrderStatus.PENDING,
+    _br_unconfirmed.status, trading.OrderStatus.PENDING)
+
+# --- XS. Exit side must follow the position, not a constant ----------------
+# register_exit was called with side="sell" unconditionally, so every SHORT
+# exit went into the ledger backwards. Same direction-blindness that made the
+# learner invert every short trade, in a different file.
+_xs_src = open(os.path.join(BACKEND, "trading.py"), encoding="utf-8").read()
+chk("XS-1 the exit side is derived, not hardcoded",
+    'side="sell", quantity=max(1, held_qty)' not in _xs_src)
+chk("XS-2 it is derived from the sign of the held quantity",
+    'exit_side = "buy" if signed_qty < 0 else "sell"' in _xs_src)
+chk("XS-3 the signed quantity is preserved before being made absolute",
+    "signed_qty = int(float(position.get" in _xs_src)
+
+# --- LP. The order ledger is environment-segregated -------------------------
+# It defaulted to backend/data/execution_ledger.json -- inside the source
+# tree, identical for paper and live. Nothing set EXECUTION_LEDGER_PATH
+# outside the tests, so paper and live would have shared one order history,
+# contradicting the segregation every other store honours.
+chk("LP-1 the ledger default routes through the shared derivation",
+    'os.path.join(resolve_data_dir(),' in _xs_src
+    and '"execution_ledger.json")' in _xs_src,
+    "resolve_data_dir used for the ledger default")
+chk("LP-2 it no longer defaults inside the source tree",
+    '"data", "execution_ledger.json"),' not in _xs_src)
+
+_lp_prev = {k: os.environ.get(k) for k in
+            ("DATA_DIR", "DATA_DIR_AUTOSET", "EXECUTION_LEDGER_PATH",
+             "DATA_ROOT", "APCA_API_KEY_ID")}
+for _k in ("DATA_DIR", "DATA_DIR_AUTOSET", "EXECUTION_LEDGER_PATH"):
+    os.environ.pop(_k, None)
+os.environ["DATA_ROOT"] = "/tmp/lp-probe"
+_lp_paths = {}
+for _key, _env in (("PKPAPER", "paper"), ("AKLIVE", "live")):
+    os.environ["APCA_API_KEY_ID"] = _key
+    _lp_paths[_env] = os.path.join(_tr.resolve_data_dir(),
+                                   "execution_ledger.json")
+chk("LP-3 paper and live resolve to different ledgers",
+    _lp_paths["paper"] != _lp_paths["live"], _lp_paths, "different")
+chk("LP-4 each sits under its own environment directory",
+    _lp_paths["paper"].endswith("/paper/execution_ledger.json")
+    and _lp_paths["live"].endswith("/live/execution_ledger.json"),
+    _lp_paths, "segregated")
+for _k, _v in _lp_prev.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
+
+
+# --- FE. Dashboard integration ---------------------------------------------
+# The backend requires a bearer token on every endpoint; the frontend sent no
+# Authorization header at all, so every dashboard request returned 401. The
+# obvious fix -- add the header in server/api.ts -- would have been WORSE: three
+# client components imported that module directly, so the token would have been
+# bundled into the browser, readable by anyone loading the page, on an API that
+# can change mode and place trades.
+#
+# The fix is architectural: api.ts is server-only and throws if evaluated in a
+# browser; client components reach it through createServerFn wrappers.
+_fe_root = os.path.dirname(BACKEND)
+_fe_api = os.path.join(_fe_root, "src", "server", "api.ts")
+_fe_src = open(_fe_api, encoding="utf-8").read()
+
+chk("FE-1 the api module refuses to run in a browser",
+    "typeof window !== 'undefined'" in _fe_src and "throw new Error" in _fe_src)
+chk("FE-2 the token comes from the environment, never a literal",
+    "process.env.API_AUTH_TOKEN" in _fe_src)
+
+_fe_calls = _re.findall(
+    r"await fetch\(`\$\{API_BASE\}(/[^`]+)`,?\s*(\{.*?\})?\s*\)",
+    _fe_src, _re.S)
+_fe_unauth = [c[0] for c in _fe_calls if "authHeaders" not in (c[1] or "")]
+chk("FE-3 every backend call sends Authorization",
+    not _fe_unauth, _fe_unauth, "none unauthenticated")
+chk("FE-4 there is more than one call, so FE-3 is not vacuous",
+    len(_fe_calls) >= 10, len(_fe_calls), ">= 10")
+
+# The endpoint the backend actually implements is /api/reset, not /api/reset-kill.
+chk("FE-5 the reset endpoint matches the backend route",
+    "/reset-kill" not in _fe_src, "/reset-kill removed")
+_fe_main = open(os.path.join(BACKEND, "main.py"), encoding="utf-8").read()
+chk("FE-6 that route exists on the backend", '"/api/reset"' in _fe_main)
+
+# No client component may import the token-bearing module.
+_fe_leaks = []
+for _dirpath, _dirnames, _files in os.walk(os.path.join(_fe_root, "src")):
+    if "node_modules" in _dirpath:
+        continue
+    for _name in _files:
+        if not _name.endswith((".tsx", ".ts")):
+            continue
+        _full = os.path.join(_dirpath, _name)
+        if _full == _fe_api or _full.endswith("actions.ts"):
+            continue
+        _text = open(_full, encoding="utf-8").read()
+        if 'from "../server/api"' in _text or "from './api'" in _text:
+            # routes/index.tsx is allowed: its uses are inside createServerFn.
+            if os.path.basename(_full) == "index.tsx" and "createServerFn" in _text:
+                continue
+            _fe_leaks.append(os.path.relpath(_full, _fe_root))
+chk("FE-7 no client component imports the token-bearing module",
+    not _fe_leaks, _fe_leaks, "none")
+
+chk("FE-8 client access goes through server functions",
+    os.path.exists(os.path.join(_fe_root, "src", "server", "actions.ts")))
+
+# CORS must permit Authorization or a browser preflight rejects every
+# authenticated request before it is sent.
+chk("FE-9 CORS allows the Authorization header",
+    "Content-Type, Authorization" in _fe_main)
+
+
+# --- DB2. Daily bars, and the signature that described the wrong trade -----
+# `store_daily_bar` validates with date.fromisoformat, which accepts
+# YYYY-MM-DD only. Reconciliation passed a full timestamp
+# ("2026-08-14T19:30:00+00:00"), so EVERY bar was rejected as malformed and
+# daily_bars never updated after the one-time backfill. Observed live, once
+# per symbol per cycle.
+_db2_dir = tempfile.mkdtemp()
+_db2 = patterns.PatternDatabase(Path(_db2_dir) / "bars.db")
+
+_db2.store_daily_bar(symbol="SPY", date_str="2026-08-14T19:30:00+00:00",
+                     open_p=1.0, high=2.0, low=0.5, close=1.5, volume=10)
+chk("DB2-1 a full timestamp is still rejected (the validator is right)",
+    len(_db2.get_recent_daily_bars("SPY", limit=5)) == 0)
+
+_db2.store_daily_bar(symbol="SPY", date_str="2026-08-14",
+                     open_p=1.0, high=2.0, low=0.5, close=1.5, volume=10)
+chk("DB2-2 a normalised date is accepted",
+    len(_db2.get_recent_daily_bars("SPY", limit=5)) == 1,
+    len(_db2.get_recent_daily_bars("SPY", limit=5)), 1)
+
+# The caller must do the normalising, exactly as the backfill path does.
+_db2_src = open(os.path.join(BACKEND, "main.py"), encoding="utf-8").read()
+chk("DB2-3 reconciliation normalises the timestamp to a date",
+    'date_str=ohlc["bar_dates"][-1].isoformat()' not in _db2_src
+    and "_bar_date = (_bar_ts.astimezone(timezone.utc).date()" in _db2_src)
+
+# The pattern signature must describe the trade that was actually made. These
+# EMAs were recomputed from daily_bars -- a different dataset, different
+# resolution, capped at 50 rows, and stale because of the bug above -- while
+# the DECISION used live indicators. The learner was keyed on numbers the
+# decision never saw: the same failure as recording P&L with the wrong sign.
+chk("DB2-4 the signature uses the indicators the decision used",
+    '_ind = (self.state.live_indicators or {}).get(symbol) or {}' in _db2_src)
+chk("DB2-5 a missing live indicator warns instead of silently using 0.0",
+    "Pattern signature for %s has no live EMAs" in _db2_src)
+chk("DB2-6 the fallback no longer hardcodes 50 bars or bare periods",
+    "get_recent_daily_bars(\n                                        symbol, limit=INDICATOR_FETCH_BARS)"
+    in _db2_src or "limit=INDICATOR_FETCH_BARS" in _db2_src)
+
+
+# --- DH. The dashboard must not undo the backend's loopback bind -----------
+# FE-* moved API_AUTH_TOKEN to the server so the browser could never read it.
+# That fix has a consequence FE-* did not cover: the server functions in
+# actions.ts authenticate to the bot on behalf of WHOEVER LOADS THE PAGE, and
+# have no login of their own. So the dashboard's bind address is now a control
+# on trading, exactly like API_BIND.
+#
+# Both dashboard entry points were inherited from a reverse-proxied sandbox
+# template and bound every interface: vite.config.ts had `host: true` plus
+# `allowedHosts: true` (which disables the Host-header check that prevents a
+# page you merely visit from driving the dev server), and serve.ts pinned
+# 0.0.0.0 with a comment refusing to honour the environment. AU-10 kept the
+# backend on loopback while `bun run dev` served the same powers to the LAN.
+_dh_root = os.path.dirname(BACKEND)
+_dh_vite_raw = open(os.path.join(_dh_root, "vite.config.ts"), encoding="utf-8").read()
+_dh_serve_raw = open(os.path.join(_dh_root, "serve.ts"), encoding="utf-8").read()
+
+
+def _dh_code(text):
+    """Strip TS comments. The first draft of DH-1/DH-2 matched the comment
+    explaining the bug rather than the setting, so it failed against the
+    fixed file -- the same false-positive shape as LP-1.
+
+    The second draft then ate `http://127.0.0.1`, because the `//` in a URL
+    scheme is not a comment. Hence the negative lookbehind for the colon."""
+    text = _re.sub(r"/\*.*?\*/", "", text, flags=_re.S)
+    return "\n".join(_re.sub(r"(?<!:)//.*$", "", ln) for ln in text.split("\n"))
+
+
+_dh_vite = _dh_code(_dh_vite_raw)
+_dh_serve = _dh_code(_dh_serve_raw)
+
+chk("DH-0 comment-stripping leaves the settings it is meant to inspect",
+    "defineConfig" in _dh_vite and "Bun.serve" in _dh_serve
+    and "SECURITY" not in _dh_vite)
+chk("DH-0b comment-stripping does not eat a URL scheme",
+    _dh_code('const u = "http://127.0.0.1:3000"; // note')
+    .strip() == 'const u = "http://127.0.0.1:3000";',
+    _dh_code('const u = "http://127.0.0.1:3000"; // note').strip(),
+    'const u = "http://127.0.0.1:3000";')
+chk("DH-1 the dev server does not bind every interface",
+    "host: true" not in _dh_vite, "host: true present", "absent")
+chk("DH-2 the dev server keeps Vite's DNS-rebinding protection",
+    "allowedHosts: true" not in _dh_vite, "allowedHosts: true present", "absent")
+chk("DH-3 the dev server defaults to loopback",
+    '?? "127.0.0.1"' in _dh_vite)
+chk("DH-4 the production server defaults to loopback",
+    '?? "127.0.0.1"' in _dh_serve)
+chk("DH-5 no dashboard entry point hardcodes all interfaces",
+    '"0.0.0.0"' not in _dh_vite and '"0.0.0.0"' not in _dh_serve)
+chk("DH-6 widening the bind is possible but announced",
+    "DASHBOARD_HOST" in _dh_vite and "DASHBOARD_HOST" in _dh_serve
+    and "WARNING" in _dh_vite and "WARNING" in _dh_serve)
+chk("DH-6b the warning fires on a wide bind, not on the loopback default",
+    _dh_vite.count('!== "127.0.0.1"') >= 1
+    and _dh_serve.count('!== "127.0.0.1"') >= 1)
+
+# The template freed the port by kill(1) under sudo, on the reasoning that
+# "every sandbox user has passwordless sudo". On a personal machine that is a
+# password prompt attached to killing an unrelated process.
+chk("DH-7 the production server does not sudo",
+    "sudo" not in _dh_serve_raw, "sudo present", "absent")
+chk("DH-8 a busy port is reported, not seized",
+    "EADDRINUSE" in _dh_serve and "already in use" in _dh_serve)
+
+# strictPort matters here specifically: without it Vite silently moves to 3001
+# on a conflict, and the operator ends up reading a stale dashboard on 3000
+# while believing it is the one they just started.
+chk("DH-9 the dev server fails rather than drifting to another port",
+    "strictPort: true" in _dh_vite)
+
+# README must not send the operator to the superseded tree. `cd site` predates
+# the token fix: site/src/server/api.ts sends no Authorization header at all,
+# so every call 401s against the current backend.
+_dh_readme = open(os.path.join(_dh_root, "README.md"), encoding="utf-8").read()
+# Collapse wrapping and markdown emphasis: the prose is hard-wrapped, so a
+# literal "no login" match broke on a line break falling between the words.
+_dh_prose = _re.sub(r"[\s*_`]+", " ", _dh_readme).lower()
+chk("DH-10 the README does not point at the superseded dashboard",
+    "cd site" not in _dh_prose, "cd site present", "absent")
+chk("DH-11 the README states the dashboard has no login of its own",
+    "no login of its own" in _dh_prose)
+chk("DH-12 the README says the bind default is loopback",
+    "127.0.0.1 by default" in _dh_prose)
+
+# --- CSRF on the server functions ------------------------------------------
+# Moving the token server-side (FE-*) made these functions authenticate to the
+# bot on behalf of whoever reaches them. Loopback does not help: the operator's
+# own browser is on loopback, so any page they visit can post to :3000.
+#
+# TanStack's x-tsr-serverFn header looked like a gate and is not one. Confirmed
+# by reading the built server bundle: `const res = await action(payload)` runs
+# BEFORE `if (!isServerFn)` is consulted, so the header only shapes the reply.
+# Omitting it makes the request "simple" and skips the CORS preflight.
+# The reachable damage is resetKill -- silently disarming a kill switch the
+# operator deliberately engaged.
+_dh_act = _dh_code(
+    open(os.path.join(_dh_root, "src", "server", "actions.ts"),
+         encoding="utf-8").read())
+
+chk("DH-13 every exported server function checks the origin",
+    _dh_act.count("assertSameOrigin(") == 5,
+    _dh_act.count("assertSameOrigin("), "4 call sites + 1 definition")
+chk("DH-14 the state-changing pair demand a positive same-origin signal",
+    _dh_act.count("assertSameOrigin(true)") == 2,
+    _dh_act.count("assertSameOrigin(true)"), 2)
+chk("DH-15 the reads are guarded too, at the weaker level",
+    _dh_act.count("assertSameOrigin(false)") == 2)
+
+# A guard that returns instead of throwing would let the call proceed.
+chk("DH-16 a rejected origin throws rather than returning",
+    _dh_act.count("throw new ForbiddenOriginError") >= 3)
+
+# The allowlist must not be derived from the request's own Host header: under
+# DNS rebinding the attacker controls Host, and a forged Origin would agree
+# with it. It has to come from configuration.
+chk("DH-17 the allowlist comes from configuration, not the request",
+    "DASHBOARD_ORIGIN" in _dh_act and "127.0.0.1" in _dh_act)
+chk("DH-18 the guard never consults the request Host to build the allowlist",
+    'getRequestHeader("host")' not in _dh_act
+    and "getRequestHost" not in _dh_act
+    and "getRequestHeader(" not in _dh_act)
+
+# Absence of Origin must not be a bypass for the state-changing calls.
+chk("DH-19 a missing Origin is refused on state-changing calls",
+    "no Origin header on a state-changing call" in _dh_act)
+
+# Every function that reaches the bot must be wrapped. If a new export appears
+# without a guard, this catches it rather than waiting for a review.
+_dh_exports = _re.findall(r"export const (\w+) = createServerFn", _dh_act)
+_dh_handlers = _re.split(r"export const \w+ = createServerFn", _dh_act)[1:]
+_dh_unguarded = [n for n, body in zip(_dh_exports, _dh_handlers)
+                 if "assertSameOrigin(" not in body]
+chk("DH-20 no server function reaches the bot without a guard",
+    not _dh_unguarded, _dh_unguarded, "none")
+chk("DH-21 there are four such functions, so DH-20 is not vacuous",
+    len(_dh_exports) == 4, len(_dh_exports), 4)
+
+# --- Shadowed imports ------------------------------------------------------
+# Renaming the imports to route through the server functions collided with a
+# local closure: HeartbeatStatus declared `const fetchHeartbeat` wrapping a
+# call to `fetchHeartbeat()`, which after the rename resolved to itself.
+# Unbounded recursion, swallowed by the surrounding catch into a permanent
+# "not alive" -- a monitoring panel that could never report a problem.
+#
+# Every FE-* check passed on this, because they assert on source text. tsc
+# found it in one run. That is the argument for `bun run typecheck` in CI.
+_dh_shadow = []
+for _dirpath, _dirnames, _files in os.walk(os.path.join(_dh_root, "src")):
+    if "node_modules" in _dirpath:
+        continue
+    for _name in _files:
+        if not _name.endswith((".ts", ".tsx")):
+            continue
+        _full = os.path.join(_dirpath, _name)
+        _text = _dh_code(open(_full, encoding="utf-8").read())
+        _imported = set()
+        for _m in _re.finditer(r"import\s*\{([^}]*)\}\s*from", _text):
+            for _part in _m.group(1).split(","):
+                _part = _part.strip().split(" as ")[-1].strip()
+                if _part:
+                    _imported.add(_part)
+        for _sym in _imported:
+            if _re.search(r"\b(?:const|let|var|function)\s+%s\b" % _re.escape(_sym),
+                          _text):
+                _dh_shadow.append("%s: %s"
+                                  % (os.path.relpath(_full, _dh_root), _sym))
+chk("DH-22 no local declaration shadows an imported name",
+    not _dh_shadow, _dh_shadow, "none")
+chk("DH-23 the shadow scan actually read the component tree",
+    os.path.exists(os.path.join(_dh_root, "src", "components",
+                                "HeartbeatStatus.tsx")))
+
+# A typecheck script must exist, because `vite build` does not typecheck --
+# esbuild strips types without verifying them, so the build passed on the
+# recursion above.
+_dh_pkg = _json.load(open(os.path.join(_dh_root, "package.json"),
+                          encoding="utf-8"))
+chk("DH-24 a typecheck script exists separately from build",
+    "typecheck" in _dh_pkg.get("scripts", {}),
+    sorted(_dh_pkg.get("scripts", {})), "includes typecheck")
+chk("DH-25 Bun's globals are typed, so serve.ts can be checked",
+    "@types/bun" in _dh_pkg.get("devDependencies", {}),
+    sorted(_dh_pkg.get("devDependencies", {})), "includes @types/bun")
 
 
 # ===========================================================================
