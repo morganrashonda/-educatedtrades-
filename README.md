@@ -157,6 +157,11 @@ port can engage the kill switch.
 Operating detail and the reasoning behind every parameter are in
 **[OPERATIONS.md](OPERATIONS.md)**.
 
+The evidence protocol for determining whether the strategy has an edge is in
+**[docs/FORWARD_TESTING.md](docs/FORWARD_TESTING.md)**. It defines the frozen
+paper-test window, decision records, cost-adjusted evaluation, learning
+boundary, and go/no-go evidence required before risking live capital.
+
 ---
 
 ## Tests
