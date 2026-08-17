@@ -63,6 +63,7 @@ send_lead_message.txt
 watchdog_alert_state.json
 health_state.json
 execution_ledger.json*
+bot.process.lock
 patterns_fits/
 backup_repo/
 notifications/

@@ -22,6 +22,7 @@ Usage:
 """
 
 import hmac
+import errno
 import json
 import math
 import logging
@@ -30,6 +31,7 @@ import signal
 import sys
 import threading
 import time
+import fcntl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from market_clock import RTH_CLOSE
@@ -623,6 +625,64 @@ def _authorized(handler) -> bool:
     return hmac.compare_digest(presented, "Bearer %s" % API_AUTH_TOKEN)
 
 
+_PROCESS_LOCK_HANDLE = None
+
+
+def acquire_process_lock(data_dir: str):
+    """Refuse a second bot process for this environment.
+
+    ``flock`` is released automatically by the kernel when the process exits,
+    so a crashed process cannot leave a stale lock that needs manual cleanup.
+    The lock is scoped to the resolved environment data directory: paper and
+    live processes may coexist, but two processes for the same environment may
+    not.
+    """
+    global _PROCESS_LOCK_HANDLE
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, "bot.process.lock")
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
+        handle.close()
+        if getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN) or isinstance(exc, BlockingIOError):
+            raise RuntimeError(
+                "another Educated Trades process already owns %s" % path)
+        raise
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write("pid=%d\n" % os.getpid())
+    handle.flush()
+    os.fsync(handle.fileno())
+    _PROCESS_LOCK_HANDLE = handle
+    return handle
+
+
+def release_process_lock() -> None:
+    """Release the current process lock during graceful shutdown."""
+    global _PROCESS_LOCK_HANDLE
+    if _PROCESS_LOCK_HANDLE is not None:
+        fcntl.flock(_PROCESS_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+        _PROCESS_LOCK_HANDLE.close()
+        _PROCESS_LOCK_HANDLE = None
+
+
+def create_api_server(host: str, port: int, orchestrator: 'Orchestrator'):
+    """Bind and return the control API server.
+
+    Binding is deliberately separate from ``serve_forever`` so startup can
+    fail synchronously when another process already owns the port.  The bot
+    must never continue its trading loops without its authenticated control
+    API available.
+    """
+    APIHandler.orchestrator_ref = orchestrator
+    server = ThreadingHTTPServer((host, port), APIHandler)
+    # Do not let an in-flight request keep the process alive on shutdown.
+    server.daemon_threads = True
+    return server
+
+
 def run_api_server(host: str, port: int, orchestrator: 'Orchestrator'):
     """Run the HTTP API server in a background thread.
 
@@ -638,10 +698,8 @@ def run_api_server(host: str, port: int, orchestrator: 'Orchestrator'):
     status-file writes. Threading the server before that would have turned an
     availability problem into a data-loss one.
     """
-    APIHandler.orchestrator_ref = orchestrator
-    server = ThreadingHTTPServer((host, port), APIHandler)
-    # Do not let an in-flight request keep the process alive on shutdown.
-    server.daemon_threads = True
+    server = create_api_server(host, port, orchestrator)
+    orchestrator._api_server = server
     logger.info("API server listening on http://%s:%d", host, port)
     server.serve_forever()
 
@@ -694,6 +752,7 @@ class Orchestrator:
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._api_thread: Optional[threading.Thread] = None
+        self._api_server = None
 
         logger.info(
             "Orchestrator initialised (mode=%s, simulate=%s, "
@@ -1241,10 +1300,15 @@ class Orchestrator:
 
         # ---- Pattern memory starts empty — builds from real pipeline outcomes ----
 
+        # Bind the control API before starting any worker loop.  If the port
+        # is already occupied, this raises synchronously and startup aborts;
+        # continuing without the authenticated control API would be unsafe.
+        self._api_server = create_api_server(API_BIND, API_PORT, self)
+        logger.info("API server bound on http://%s:%d", API_BIND, API_PORT)
+
         # Start API server in background thread
         self._api_thread = threading.Thread(
-            target=run_api_server,
-            args=(API_BIND, API_PORT, self),
+            target=self._api_server.serve_forever,
             daemon=True,
         )
         self._api_thread.start()
@@ -2576,6 +2640,10 @@ class Orchestrator:
         """Stop the orchestrator gracefully."""
         self.state.running = False
         self._stop_event.set()
+        if self._api_server is not None:
+            self._api_server.shutdown()
+            self._api_server.server_close()
+            self._api_server = None
         logger.info("Orchestrator stopping...")
 
     def _recover_positions_on_startup(self) -> None:
@@ -2618,6 +2686,24 @@ class Orchestrator:
             from position_state import PositionStateManager
             mgr = PositionStateManager()
             state_positions = mgr.load_positions()
+
+            # Simulation has no broker position endpoint by design. An empty
+            # local state is the valid flat starting point for a dry run; do
+            # not turn that into a false startup-recovery block. If simulated
+            # positions already exist, fail closed because there is no broker
+            # truth available to reconcile them against.
+            if self.trading.broker.is_simulating:
+                if state_positions:
+                    raise RuntimeError(
+                        "simulation mode cannot reconcile persisted positions "
+                        "without broker truth"
+                    )
+                logger.info(
+                    "Simulation mode: no broker reconciliation required; "
+                    "starting flat"
+                )
+                self.state.startup_recovery_blocked = False
+                return
 
             if not state_positions:
                 logger.info("No persisted position state found — validating broker positions.")
@@ -3038,17 +3124,23 @@ class Orchestrator:
             return result
             
         elif phase in ("holiday", "weekend"):
-            logger.info(f"PHASE: {phase}. Standby — running reconciliation & one-time backfill.")
+            logger.info(f"PHASE: {phase}. Standby — running reconciliation.")
             if self._last_recon_date != today_str:
                 self.run_reconciliation()
                 self._last_recon_date = today_str
             # ---- Historical data backfill on weekends/holidays ----
             # Fetch real daily bars from Alpaca so RSI/ADX have history to
-            # work with when the market opens on Monday.
-            try:
-                self._run_historical_backfill()
-            except Exception as bfe:
-                logger.error("Weekend backfill FAILED: %s", bfe)
+            # work with when the market opens on Monday. Startup already
+            # performs this check, so do not refetch on every 120-second
+            # weekend cycle. A failed or partial backfill remains eligible
+            # for retry on the next cycle.
+            if not self.state.backfill_done:
+                try:
+                    self._run_historical_backfill()
+                except Exception as bfe:
+                    logger.error("Weekend backfill FAILED: %s", bfe)
+            else:
+                logger.info("Weekend backfill skipped — already complete")
             self._finalize_cycle(cycle_start, result)
             return result
 
@@ -4858,6 +4950,7 @@ def _signal_handler(sig, frame):
     logger.info("Received signal %s. Shutting down...", sig)
     if _orchestrator:
         _orchestrator.stop()
+    release_process_lock()
     sys.exit(0)
 
 
@@ -4903,6 +4996,16 @@ if __name__ == "__main__":
             "API_AUTH_TOKEN is required -- the control API can change mode "
             "and place trades. Set a strong token and restart.")
         sys.exit(1)
+
+    # Acquire the environment-scoped singleton before constructing the broker
+    # or running recovery. A duplicate must do no work and must not compete
+    # for the control port, broker session, ledger, or position state.
+    try:
+        acquire_process_lock(DATA_DIR)
+    except RuntimeError as exc:
+        logging.getLogger("educator").critical("Startup refused: %s", exc)
+        sys.exit(1)
+
     extended_hours = (
         "--extended-hours" in args
         or os.environ.get("ALLOW_EXTENDED_HOURS", "").strip().lower()
@@ -4948,9 +5051,9 @@ if __name__ == "__main__":
 
     if api_only:
         logger.info("Starting in API-only mode (no pipeline)")
+        orch._api_server = create_api_server(API_BIND, API_PORT, orch)
         orch._api_thread = threading.Thread(
-            target=run_api_server,
-            args=(API_BIND, API_PORT, orch),
+            target=orch._api_server.serve_forever,
             daemon=True,
         )
         orch._api_thread.start()
@@ -4967,4 +5070,5 @@ if __name__ == "__main__":
                 time.sleep(1)
         except KeyboardInterrupt:
             orch.stop()
+            release_process_lock()
             print("\nOrchestrator stopped. Goodbye!")

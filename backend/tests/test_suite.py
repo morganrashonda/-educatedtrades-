@@ -4180,7 +4180,7 @@ chk("AU-8 auth is not conditional on a token being present",
 # skipped Orchestrator.start() entirely and bound an open API.
 _au_argparse = _au_src.index('api_only = "--api-only" in args')
 _au_required = _au_src.index("API_AUTH_TOKEN is required")
-_au_bind = _au_src.index("args=(API_BIND, API_PORT, orch)")
+_au_bind = _au_src.index("create_api_server(API_BIND, API_PORT, orch)")
 chk("AU-9 the token is required before --api-only can bind a socket",
     _au_argparse < _au_required < _au_bind,
     (_au_argparse, _au_required, _au_bind), "checked between parse and bind")
@@ -4866,7 +4866,7 @@ chk("PS-4 the temp file is unique per writer, not shared",
 # switch is the moment something else is already stuck.
 _as_src = open(os.path.join(BACKEND, "main.py"), encoding="utf-8").read()
 chk("AS-1 the API server handles requests concurrently",
-    "ThreadingHTTPServer((host, port)" in _as_src)
+    "server = ThreadingHTTPServer((host, port)" in _as_src)
 chk("AS-2 the plain single-request server is not used anywhere",
     "= HTTPServer(" not in _as_src)
 chk("AS-3 an in-flight request cannot keep the process alive on shutdown",
@@ -5296,6 +5296,14 @@ _db2_src = open(os.path.join(BACKEND, "main.py"), encoding="utf-8").read()
 chk("DB2-3 reconciliation normalises the timestamp to a date",
     'date_str=ohlc["bar_dates"][-1].isoformat()' not in _db2_src
     and "_bar_date = (_bar_ts.astimezone(timezone.utc).date()" in _db2_src)
+
+_weekend_start = _db2_src.index('elif phase in ("holiday", "weekend")')
+_weekend_end = _db2_src.index('self._finalize_cycle(cycle_start, result)',
+                               _weekend_start)
+_weekend_src = _db2_src[_weekend_start:_weekend_end]
+chk("DB2-7 weekend backfill respects the completed flag",
+    "if not self.state.backfill_done:" in _weekend_src
+    and "Weekend backfill skipped — already complete" in _weekend_src)
 
 # The pattern signature must describe the trade that was actually made. These
 # EMAs were recomputed from daily_bars -- a different dataset, different
