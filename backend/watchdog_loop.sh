@@ -29,10 +29,36 @@ if [ -f "$PID_FILE" ]; then
 fi
 echo $$ > "$PID_FILE"
 
-trap 'rm -f "$PID_FILE"' EXIT INT TERM
+CHILD_PID=""
+
+cleanup() {
+    rm -f "$PID_FILE"
+}
+
+shutdown() {
+    # A trap that only performs cleanup returns to the infinite loop. Stop the
+    # command currently being supervised, then exit so the EXIT trap removes
+    # the PID file and the watchdog cannot silently continue running.
+    trap - INT TERM
+    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        kill "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+    exit 0
+}
+
+trap cleanup EXIT
+trap shutdown INT TERM
 
 while true; do
     cd "$SCRIPT_DIR"
-    python3 watchdog.py >> "$LOG_FILE" 2>&1
-    sleep 60
+    python3 watchdog.py >> "$LOG_FILE" 2>&1 &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || true
+    CHILD_PID=""
+
+    sleep 60 &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || true
+    CHILD_PID=""
 done

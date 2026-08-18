@@ -2440,6 +2440,7 @@ class Orchestrator:
             symbol_bars = []
             try:
                 from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.enums import DataFeed
                 from alpaca.data.requests import StockBarsRequest
                 from alpaca.data.timeframe import TimeFrame
                 from datetime import datetime, timedelta
@@ -2469,6 +2470,7 @@ class Orchestrator:
                     timeframe=TimeFrame.Day,
                     start=end_time - timedelta(days=730),
                     end=end_time,
+                    feed=DataFeed.IEX,  # Paper accounts are entitled to IEX, not SIP
                 )
                 resp = client.get_stock_bars(req)
                 data = resp.data.get(symbol, []) if hasattr(resp, "data") else []

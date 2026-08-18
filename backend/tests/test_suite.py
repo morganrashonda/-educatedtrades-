@@ -4442,7 +4442,11 @@ chk("WL-2 the log is separated too, so the two do not interleave",
 chk("WL-3 a recycled PID belonging to something else is not signalled",
     "kill -0" in _wl and "watchdog_loop.sh*" in _wl)
 chk("WL-4 the PID file is removed on exit",
-    "trap 'rm -f \"$PID_FILE\"' EXIT" in _wl)
+    "trap cleanup EXIT" in _wl and 'rm -f "$PID_FILE"' in _wl)
+chk("WL-5 TERM and INT exit instead of returning to the loop",
+    "trap shutdown INT TERM" in _wl and "exit 0" in _wl)
+chk("WL-6 shutdown terminates the currently supervised child",
+    'kill "$CHILD_PID"' in _wl and 'wait "$CHILD_PID"' in _wl)
 
 
 # --- TS. The ledger under threads ------------------------------------------

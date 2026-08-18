@@ -36,7 +36,10 @@ jobs:
         run: python backend/tests/test_end_to_end.py
 
       - name: Remaining pytest tests
-        run: python -m pytest -q backend/tests || true
+        run: >-
+          python -m pytest -q -p no:cacheprovider backend/tests
+          --ignore=backend/tests/test_suite.py
+          --ignore=backend/tests/test_end_to_end.py
 
       - name: Dry-run — one cycle in simulate mode
         env:
@@ -50,13 +53,40 @@ jobs:
           API_BIND: 127.0.0.1
         run: |
           cd backend
-          timeout 15 python main.py --simulate 2>&1 | tee /tmp/ci_dryrun.log &
+          python main.py --simulate > /tmp/ci_dryrun.log 2>&1 &
           CI_PID=$!
-          sleep 10
-          kill $CI_PID 2>/dev/null || true
-          wait $CI_PID 2>/dev/null || true
-          # Assert, do not just echo. `grep && echo` succeeds either way when
-          # it is the last command in a step that ignores its status.
-          grep -q "Orchestrator initialised" /tmp/ci_dryrun.log \
-            || { echo "FAIL: orchestrator never initialised"; cat /tmp/ci_dryrun.log; exit 1; }
-          echo "Dry-run complete: orchestrator started"
+          cleanup() {
+            kill "$CI_PID" 2>/dev/null || true
+            wait "$CI_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:3099/api/status \
+              -H "Authorization: Bearer ${API_AUTH_TOKEN}" \
+              -o /tmp/ci_status.json; then
+              READY=1
+              break
+            fi
+            kill -0 "$CI_PID" 2>/dev/null \
+              || { echo "FAIL: orchestrator exited"; cat /tmp/ci_dryrun.log; exit 1; }
+            sleep 1
+          done
+          [ "$READY" -eq 1 ] \
+            || { echo "FAIL: authenticated API never became ready"; cat /tmp/ci_dryrun.log; exit 1; }
+
+          CYCLE=0
+          for _ in $(seq 1 30); do
+            if grep -q "Cycle #1 complete" /tmp/ci_dryrun.log; then
+              CYCLE=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$CYCLE" -eq 1 ] \
+            || { echo "FAIL: first pipeline cycle never completed"; cat /tmp/ci_dryrun.log; exit 1; }
+          grep -q "Orchestrator started" /tmp/ci_dryrun.log \
+            || { echo "FAIL: startup milestone missing"; cat /tmp/ci_dryrun.log; exit 1; }
+          python -c 'import json; d=json.load(open("/tmp/ci_status.json")); assert d["status"] == "running"; assert d["orchestrator"]["running"] is True'
+          echo "Dry-run complete: authenticated API ready and cycle 1 completed"
