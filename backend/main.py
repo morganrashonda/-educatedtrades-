@@ -33,7 +33,7 @@ import threading
 import time
 import fcntl
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 from market_clock import RTH_CLOSE
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +53,7 @@ _trading = None
 _news = None
 _stats = None
 _monitoring = None
+_shadow_forward = None
 
 
 def _import_monitoring():
@@ -93,6 +94,14 @@ def _import_news():
         import news_ingestion as n
         _news = n
     return _news
+
+
+def _import_shadow_forward():
+    global _shadow_forward
+    if _shadow_forward is None:
+        import shadow_forward as sf
+        _shadow_forward = sf
+    return _shadow_forward
 
 def _import_stats(): 
     global _stats 
@@ -218,8 +227,10 @@ OVERNIGHT_HORIZON_MINUTES = int(
 USE_DAILY_BARS = BAR_TIMEFRAME_MINUTES in (0, 1440)
 # Minimum conviction threshold to consider a trade
 MIN_CONVICTION_THRESHOLD = 0.10
-# High conviction threshold for autonomous execution
-HIGH_CONVICTION_THRESHOLD = 0.20
+# High conviction threshold for autonomous execution. TradingEngine's final
+# actionable gate is 0.30, so the orchestrator must not advertise 0.20 as
+# executable and then have the engine silently refuse it.
+HIGH_CONVICTION_THRESHOLD = 0.30
 # Default API port
 API_PORT = int(os.environ.get("API_PORT", "3099"))
 #: The control API can start, stop and place trades. It bound to 0.0.0.0 by
@@ -269,8 +280,82 @@ TIER_2_ADX_CEILING = 22.0
 TIER_2_RISK_FACTOR = 0.15
 TIER_2_DAILY_CAP = 3
 
+# Shadow-forward cold-start repair. Shadow observations never enter
+# pattern_memory and can only qualify a one-share PAPER exploration order.
+SHADOW_DB_PATH = os.path.join(DATA_DIR, "shadow_forward.db")
+SHADOW_SIGNAL_THRESHOLD = 0.20
+SHADOW_PROMOTION_MIN_TRADES = 100
+SHADOW_PROMOTION_MIN_DAYS = 20
+PAPER_EXPLORATION_DAILY_CAP = 2
+PATTERN_EXECUTION_MIN_RESOLVED = 20
+
 # Tier 1 position size (modestly reduced from 0.5%)
 TIER_1_RISK_PER_TRADE = 0.004
+
+
+def regime_info_from_indicators(indicators: dict) -> dict:
+    """Build aggregate telemetry plus an independent regime per symbol.
+
+    The aggregate regime is useful on a dashboard, but it must not choose the
+    strategy for every instrument. Averaging a trending ETF with a
+    range-bound ETF can turn both into a third, fictional market state.
+    """
+    pmod = _import_patterns()
+    detail = {}
+    adx_values = []
+    for symbol, values in (indicators or {}).items():
+        adx = values.get("adx")
+        regime = pmod.classify_regime(adx)
+        strategy = pmod.get_strategy_for_regime(regime)
+        size_factor = pmod.get_position_size_factor(regime)
+        detail[symbol] = {
+            "adx": adx,
+            "regime": regime,
+            "strategy": strategy,
+            "position_size_factor": size_factor,
+        }
+        if adx is not None:
+            adx_values.append(float(adx))
+
+    avg_adx = round(sum(adx_values) / len(adx_values), 2) if adx_values else None
+    aggregate_regime = pmod.classify_regime(avg_adx)
+    return {
+        "regime": aggregate_regime,
+        "adx": avg_adx,
+        "strategy": pmod.get_strategy_for_regime(aggregate_regime),
+        "position_size_factor": pmod.get_position_size_factor(aggregate_regime),
+        "detail": detail,
+        "updated_at": time.time(),
+    }
+
+
+def _epoch_timestamp(value) -> Optional[float]:
+    """Parse a market-data timestamp without guessing a local timezone."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(
+            value, datetime_time.min, tzinfo=timezone.utc)
+    elif isinstance(value, str):
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(text)
+    else:
+        return float(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def learned_pattern_allows_execution(
+    conviction: float, resolved_samples: int, minimum_conviction: float,
+) -> bool:
+    """Normal size requires outcomes, not merely an open pattern record."""
+    return (
+        int(resolved_samples) >= PATTERN_EXECUTION_MIN_RESOLVED
+        and abs(float(conviction)) >= float(minimum_conviction)
+    )
 
 # Max daily loss limit (as a percentage, default 3.0%).
 # When exceeded, all positions are closed and trading pauses until the next
@@ -375,6 +460,8 @@ class PipelineState:
     tier_2_total_trades: int = 0
     tier_2_eval_cycle: int = 0
     signal_trade_count: int = 0
+    paper_exploration_trades_today: int = 0
+    paper_exploration_total_trades: int = 0
     drawdown_killed: bool = False
     killed: bool = False  # KILLED state flag — blocks trading, persisted to KILLED_STATE file
     health_failed_this_session: bool = False  # Pre-market health FAIL advisory, resets on phase change
@@ -400,6 +487,8 @@ class PipelineState:
     news_headlines_used: int = 0
     live_indicators: dict = field(default_factory=dict)
     indicators_valid: bool = False
+    refusal_counts: Dict[str, int] = field(default_factory=dict)
+    latest_refusals: Dict[str, int] = field(default_factory=dict)
 
     # Historical data backfill
     backfill_done: bool = False
@@ -441,6 +530,8 @@ class PipelineState:
             "tier_2_trades_today": self.tier_2_trades_today,
             "tier_2_total_trades": self.tier_2_total_trades,
             "tier_2_eval_cycle": self.tier_2_eval_cycle,
+            "paper_exploration_trades_today": self.paper_exploration_trades_today,
+            "paper_exploration_total_trades": self.paper_exploration_total_trades,
             "kill_switch_active": bool(self.mode == OrchestratorMode.KILLED),
             "consecutive_ref_price_failures": self.consecutive_ref_price_failures,
             "consecutive_transient_cycle_failures": self.consecutive_transient_cycle_failures,
@@ -452,6 +543,8 @@ class PipelineState:
             "news_headlines_used": self.news_headlines_used,
             "indicators_valid": self.indicators_valid,
             "live_indicators": self.live_indicators,
+            "refusal_counts": dict(self.refusal_counts or {}),
+            "latest_refusals": dict(self.latest_refusals or {}),
         }
 
 
@@ -555,6 +648,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 "/api/gate-status": lambda: {
                     "signal_trade_count": orch.state.signal_trade_count,
                     "exploration_trade_count": orch.state.tier_2_total_trades,
+                    "paper_exploration_trade_count": orch.state.paper_exploration_total_trades,
+                    "refusal_counts": dict(orch.state.refusal_counts or {}),
+                    "latest_refusals": dict(orch.state.latest_refusals or {}),
+                    "shadow_forward": orch.get_shadow_status(),
                     "consecutive_ref_price_failures": orch.state.consecutive_ref_price_failures,
                     "news_fetch_degraded": orch.state.news_fetch_degraded,
                     "categories_attempted": orch.state.news_categories_attempted,
@@ -564,6 +661,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "headlines_used": orch.state.news_headlines_used,
                     "status": "tracking signal trades only (Tier 2 excluded)",
                 },
+                "/api/shadow-forward": lambda: orch.get_shadow_status(),
                 "/health": lambda: {"status": "ok", "timestamp": time.time()},
             },
             "POST": {
@@ -746,6 +844,7 @@ class Orchestrator:
         self._trading_engine = None
         self._news_ingestion = None
         self._stats_engine = None
+        self._shadow_forward_store = None
 
         # Threading
         self._pipeline_thread: Optional[threading.Thread] = None
@@ -791,6 +890,17 @@ class Orchestrator:
             mod = _import_news()
             self._news_ingestion = mod.NewsIngestion()
         return self._news_ingestion
+
+    @property
+    def shadow(self):
+        if self._shadow_forward_store is None:
+            mod = _import_shadow_forward()
+            self._shadow_forward_store = mod.ShadowForwardStore(
+                SHADOW_DB_PATH,
+                stop_pct=STOP_LOSS_PCT,
+                target_pct=TAKE_PROFIT_PCT,
+            )
+        return self._shadow_forward_store
 
     @property
     def alerts(self):
@@ -1213,8 +1323,12 @@ class Orchestrator:
 
                         # Migration: tier_2/signal keys added in PR #17.
                         # Persisted state from before that merge won't have them.
-                        migration_keys = ["tier_2_trades_today", "tier_2_total_trades",
-                                          "tier_2_eval_cycle", "signal_trade_count"]
+                        migration_keys = [
+                            "tier_2_trades_today", "tier_2_total_trades",
+                            "tier_2_eval_cycle", "signal_trade_count",
+                            "paper_exploration_trades_today",
+                            "paper_exploration_total_trades",
+                        ]
                         missing_migration = [k for k in migration_keys if k not in data]
                         if missing_migration:
                             logger.warning(
@@ -1226,6 +1340,10 @@ class Orchestrator:
                         self.state.tier_2_total_trades = int(data.get("tier_2_total_trades", 0))
                         self.state.tier_2_eval_cycle = int(data.get("tier_2_eval_cycle", 0))
                         self.state.signal_trade_count = int(data.get("signal_trade_count", 0))
+                        self.state.paper_exploration_trades_today = int(
+                            data.get("paper_exploration_trades_today", 0))
+                        self.state.paper_exploration_total_trades = int(
+                            data.get("paper_exploration_total_trades", 0))
 
                         # If we backfilled missing keys, persist them immediately
                         # so the next restart loads a clean state without a migration warning.
@@ -1790,6 +1908,8 @@ class Orchestrator:
                 # path silently sees None and never generates a signal.
                 ema_short = pmod.compute_ema(closes, EMA_SHORT_PERIOD)
                 ema_long = pmod.compute_ema(closes, EMA_LONG_PERIOD)
+                prev_ema_short = pmod.compute_ema(closes[:-1], EMA_SHORT_PERIOD)
+                prev_ema_long = pmod.compute_ema(closes[:-1], EMA_LONG_PERIOD)
                 # Recent volatility makes trend conviction dimensionless, so
                 # the same thresholds hold at any bar size.
                 volatility_pct = pmod.realized_volatility_pct(closes)
@@ -1810,8 +1930,21 @@ class Orchestrator:
                     "regime": regime,
                     "ema_short": ema_short,
                     "ema_long": ema_long,
+                    "prev_ema_short": prev_ema_short,
+                    "prev_ema_long": prev_ema_long,
                     "volatility_pct": volatility_pct,
+                    "bar_timestamp": ohlc.get("bar_timestamp"),
                 }
+                # Advance already-recorded shadows from closed bars. This
+                # store has no broker methods and is separate from learning.
+                if hasattr(self, "_shadow_forward_store"):
+                    try:
+                        self.shadow.observe_bars(sym, ohlc)
+                    except Exception as shadow_exc:
+                        logger.warning(
+                            "SHADOW [%s]: outcome update failed "
+                            "(trading unaffected): %s", sym, shadow_exc,
+                        )
                 any_valid = True
                 _bar_ts = ohlc.get("bar_timestamp") if ohlc else None
                 logger.info(
@@ -1841,44 +1974,24 @@ class Orchestrator:
           - trending      (avg ADX > 25): trend-following, full size
           - range_bound   (avg ADX < 20): MEAN-REVERSION (fade RSI extremes)
           - transitioning (20-25):        trend-following, HALF size
-          - unknown       (no data):      default trend-following, full size
+          - unknown       (no data):      no strategy, zero size (fail closed)
         """
         pmod = _import_patterns()
         symbols = symbols or ["SPY", "QQQ"]
-        adx_values, detail = [], {}
+        indicators = {}
         for sym in symbols:
             ohlc = self._fetch_ohlc(sym)
             adx = None
             if ohlc:
                 adx = pmod.compute_adx(ohlc["highs"], ohlc["lows"], ohlc["closes"])
-            detail[sym] = {"adx": adx, "regime": pmod.classify_regime(adx)}
-            if adx is not None:
-                adx_values.append(adx)
+            indicators[sym] = {"adx": adx}
 
-        avg_adx = round(sum(adx_values) / len(adx_values), 2) if adx_values else None
-        regime = pmod.classify_regime(avg_adx)
-
-        if regime == "range_bound":
-            strategy, size_factor = "mean_reversion", 1.0
-        elif regime == "transitioning":
-            strategy, size_factor = "trend_following", 0.5
-        elif regime == "unknown":
-            strategy, size_factor = "none", 0.0
-        else:  # trending
-            strategy, size_factor = "trend_following", 1.0
-
-        regime_info = {
-            "regime": regime,
-            "adx": avg_adx,
-            "strategy": strategy,
-            "position_size_factor": size_factor,
-            "detail": detail,
-            "updated_at": time.time(),
-        }
+        regime_info = regime_info_from_indicators(indicators)
         self.state.market_regime = regime_info
         logger.info(
             "Regime: %s (avg ADX=%s) → strategy=%s, size×%.2f",
-            regime, avg_adx, strategy, size_factor,
+            regime_info["regime"], regime_info["adx"],
+            regime_info["strategy"], regime_info["position_size_factor"],
         )
         return regime_info
 
@@ -2018,6 +2131,7 @@ class Orchestrator:
                     exc_info=True,
                 )
                 return None
+
         else:
             logger.warning("OHLC fetch for %s — broker in simulation mode, no real bars", symbol)
 
@@ -2029,6 +2143,101 @@ class Orchestrator:
             symbol,
         )
         return None
+
+    def _record_refusal(self, reason: str, symbol: str = "") -> None:
+        """Count a declined candidate so zero trades remains explainable."""
+        key = reason.strip().lower().replace(" ", "_")
+        self.state.refusal_counts[key] = self.state.refusal_counts.get(key, 0) + 1
+        self.state.latest_refusals[key] = self.state.latest_refusals.get(key, 0) + 1
+        logger.debug("REFUSAL%s: %s", " [%s]" % symbol if symbol else "", key)
+
+    def _paper_exploration_gate(
+        self, pattern_hash: str, side: Optional[str], raw_conviction: float,
+        market_open: bool, strategy: str, regime: str,
+    ) -> tuple:
+        """Authorize only statistically promoted, one-share PAPER exploration."""
+        blockers = []
+        try:
+            evidence = self.shadow.evidence(
+                pattern_hash,
+                minimum_trades=SHADOW_PROMOTION_MIN_TRADES,
+                minimum_days=SHADOW_PROMOTION_MIN_DAYS,
+                side=side,
+                strategy=strategy,
+                regime=regime,
+            )
+        except Exception as exc:
+            return False, "shadow evidence unavailable: %s" % exc, {
+                "paper_exploration_eligible": False,
+                "error": str(exc),
+            }
+        if not evidence.get("paper_exploration_eligible"):
+            return False, "shadow evidence gate not met", evidence
+        if side != "buy":
+            blockers.append("paper exploration is long-only")
+        if abs(raw_conviction) < self.high_conviction:
+            blockers.append("raw conviction below actionable threshold")
+        if not self.state.is_autonomous:
+            blockers.append("not autonomous")
+        if not market_open:
+            blockers.append("market closed")
+        if self.state.news_fetch_degraded:
+            blockers.append("news ingestion degraded")
+        if self.state.startup_recovery_blocked:
+            blockers.append("startup recovery incomplete")
+        if self.state.health_failed_this_session:
+            blockers.append("pre-market health failed")
+        if self.state.paper_exploration_trades_today >= PAPER_EXPLORATION_DAILY_CAP:
+            blockers.append("paper exploration daily cap reached")
+
+        broker = self.trading.broker
+        if broker.is_simulating or getattr(broker, "environment", None) != "paper":
+            blockers.append("paper broker required")
+        else:
+            try:
+                positions = self.trading.get_broker_positions()
+                if positions:
+                    blockers.append("an account position is already open")
+            except Exception as exc:
+                blockers.append("broker position truth unavailable: %s" % exc)
+
+        allowed, safety_reason = self.authorize_entry("shadow-promoted exploration")
+        if not allowed:
+            blockers.append(safety_reason)
+        return not blockers, "; ".join(blockers) if blockers else "authorized", evidence
+
+    def _record_filled_pattern(
+        self, symbol: str, side: str, conviction: float, rsi_value: float,
+        exec_result, signal_dict: dict, strategy: str, regime: str, tier: str,
+    ) -> None:
+        """Persist the exact indicators used by a filled decision."""
+        indicators = (self.state.live_indicators or {}).get(symbol) or {}
+        ema_short = indicators.get("ema_short")
+        ema_long = indicators.get("ema_long")
+        if ema_short is None or ema_long is None:
+            raise RuntimeError("live EMA identity unavailable after fill")
+        rid, pattern_hash = self.patterns.record_trade_pattern_and_track(
+            symbol=symbol,
+            sentiment_score=0.0,
+            conviction_score=conviction,
+            rsi_value=rsi_value,
+            ema_short=ema_short,
+            ema_long=ema_long,
+            prev_ema_short=indicators.get("prev_ema_short"),
+            prev_ema_long=indicators.get("prev_ema_long"),
+            entry_price=exec_result.filled_price,
+            quantity=exec_result.filled_qty or exec_result.quantity,
+            side=side,
+            tier=tier,
+        )
+        signal_dict["pattern_record_id"] = rid
+        signal_dict["pattern_hash"] = pattern_hash
+        self.trading.persist_filled_trade(
+            symbol=symbol, pattern_id=rid, strategy=strategy, regime=regime)
+        logger.info(
+            "Pattern tracked [%s]: record_id=%d hash=%s tier=%s",
+            symbol, rid, pattern_hash, tier,
+        )
 
 
     def _compute_ema(self, prices: List[float], period: int) -> Optional[float]:
@@ -2550,6 +2759,7 @@ class Orchestrator:
             self.state.daily_loss_hit = False
             self.state.daily_pnl_pct = 0.0
             self.state.tier_2_trades_today = 0
+            self.state.paper_exploration_trades_today = 0
             self._save_daily_tracking()
 
             logger.info(
@@ -2983,6 +3193,7 @@ class Orchestrator:
         cycle_start = time.time()
         self.state.cycle_count += 1
         cycle_num = self.state.cycle_count
+        self.state.latest_refusals = {}
 
         # Reset reference-price tracking flags at the start of each cycle.
         # Execute() and _calculate_quantity() will set these during the cycle.
@@ -3243,32 +3454,17 @@ class Orchestrator:
         # ---- Step 2.5: Market Regime Detection (from live indicators) ----
         try:
             if self.state.indicators_valid and self.state.live_indicators:
-                adx_values = [v["adx"] for v in self.state.live_indicators.values() if v.get("adx") is not None]
-                avg_adx = round(sum(adx_values) / len(adx_values), 2) if adx_values else None
-                pmod = _import_patterns()
-                if avg_adx is None:
-                    # No symbols produced a valid ADX — trade with extreme caution.
-                    logger.warning("No valid ADX across any symbol — setting strategy=none, size=0.0 to block trading")
-                    regime_info = {
-                        "regime": "unknown",
-                        "adx": None,
-                        "strategy": "none",
-                        "position_size_factor": 0.0,
-                    }
-                else:
-                    regime = pmod.classify_regime(avg_adx)
-                    regime_info = {
-                        "regime": regime,
-                        "adx": avg_adx,
-                        "strategy": pmod.get_strategy_for_regime(regime),
-                        "position_size_factor": pmod.get_position_size_factor(regime),
-                    }
+                regime_info = regime_info_from_indicators(
+                    self.state.live_indicators)
+                self.state.market_regime = regime_info
             else:
-                regime_info = self.state.market_regime
-            result["steps"]["regime"] = {"status": "ok", **{
-                k: regime_info[k] for k in ("regime", "adx", "strategy",
-                                            "position_size_factor")
-            }}
+                regime_info = {
+                    "regime": "unknown", "adx": None, "strategy": "none",
+                    "position_size_factor": 0.0, "detail": {},
+                    "updated_at": time.time(),
+                }
+                self.state.market_regime = regime_info
+            result["steps"]["regime"] = {"status": "ok", **regime_info}
         except Exception as e:
             logger.error("Step 2.5 (regime) FAILED: %s", e)
             result["steps"]["regime"] = {"status": "error", "error": str(e)}
@@ -3276,9 +3472,6 @@ class Orchestrator:
 
         # ---- Step 3: Pattern Cross-Reference ----
         try:
-            # Use the aggregate conviction for primary signal evaluation
-            agg_conv = sent_result.aggregate_conviction
-
             # Evaluate patterns for major symbols
             primary_symbols = list(TRADING_SYMBOLS)
             pattern_results = []
@@ -3289,6 +3482,7 @@ class Orchestrator:
                 rsi_value = live.get("rsi")
                 if rsi_value is None:
                     logger.warning("  No live RSI for %s — skipping signal (fail closed)", sym)
+                    self._record_refusal("indicator unavailable", sym)
                     pattern_results.append({
                         "symbol": sym,
                         "action": "skip",
@@ -3298,12 +3492,14 @@ class Orchestrator:
                         "reason": "No live indicator data available",
                     })
                     continue
-                # Fetch OHLC for EMA computation only
-                ohlc = self._fetch_ohlc(sym)
-                _ema_s = self._compute_ema(ohlc["closes"], 20) if ohlc else None
-                _ema_l = self._compute_ema(ohlc["closes"], 50) if ohlc else None
+                # Reuse the exact closed-bar series computed in Step 1. A
+                # second fetch can cross a bar boundary and make the decision
+                # disagree with the indicator log.
+                _ema_s = live.get("ema_short")
+                _ema_l = live.get("ema_long")
                 if _ema_s is None or _ema_l is None:
                     logger.warning("  ⏭️ Skipping signal for %s — EMA unavailable", sym)
+                    self._record_refusal("ema unavailable", sym)
                     pattern_results.append({
                         "symbol": sym,
                         "action": "skip",
@@ -3321,13 +3517,23 @@ class Orchestrator:
                 _live = self.state.live_indicators.get(sym, {})
                 _tconv = _import_patterns().trend_conviction(
                     _live.get("adx"), _ema_s, _ema_l, _live.get("volatility_pct"))
+                _symbol_strategy = (
+                    (regime_info.get("detail") or {}).get(sym, {})
+                    .get("strategy", "none")
+                )
+                _signature_conviction = (
+                    _import_patterns().mean_reversion_conviction(rsi_value)
+                    if _symbol_strategy == "mean_reversion" else _tconv
+                )
                 pattern_signal = self.patterns.evaluate(
                     symbol=sym,
                     sentiment_score=0.0,
-                    conviction_score=_tconv,
+                    conviction_score=_signature_conviction,
                     rsi_value=rsi_value,
                     ema_short=_ema_s,
                     ema_long=_ema_l,
+                    prev_ema_short=_live.get("prev_ema_short"),
+                    prev_ema_long=_live.get("prev_ema_long"),
                 )
                 pattern_results.append({
                     "symbol": sym,
@@ -3335,8 +3541,14 @@ class Orchestrator:
                     "conviction": pattern_signal.conviction,
                     "rsi_value": rsi_value,
                     "historical_samples": pattern_signal.pattern_stats.count,
+                    "resolved_samples": pattern_signal.pattern_stats.resolved,
+                    "pattern_hash": pattern_signal.pattern_signature.hash_id,
+                    "pattern_label": pattern_signal.pattern_signature.label,
+                    "raw_price_conviction": _signature_conviction,
                     "reason": pattern_signal.reason[:100],
                 })
+                if pattern_signal.pattern_stats.count == 0:
+                    self._record_refusal("no pattern history", sym)
                 (logger.debug if pattern_signal.pattern_stats.count == 0 else logger.info)(
                     "  Pattern [%s]: %s (%.3f, samples=%d)",
                     sym, pattern_signal.action.upper(),
@@ -3364,46 +3576,82 @@ class Orchestrator:
             for pr in pattern_results:
                 symbol = pr["symbol"]
                 pattern_conv = pr["conviction"]
-                _strategy = regime_info.get("strategy", "trend_following")
-
-                # Conviction gate. Sentiment no longer participates: on
-                # SPY/QQQ/IWM headline sentiment is not a defensible signal,
-                # so the pattern engine's learned conviction is the gate.
-                # Mean reversion is exempt -- there the RSI extreme IS the
-                # signal, and a learned prior would only mute it.
-                if _strategy != "mean_reversion" and abs(pattern_conv) < self.min_conviction:
-                    logger.debug(
-                        "Signal [%s] refused: pattern conviction %.3f below "
-                        "min_conviction %.3f",
-                        symbol, pattern_conv, self.min_conviction,
-                    )
-                    continue
-
-                # Conviction is derived from PRICE, then modulated by what
-                # the pattern engine has learned. Previously this averaged in
-                # sentiment, which on index ETFs contributed noise with a
-                # confident-looking number attached.
                 rsi_value = pr.get("rsi_value", 50.0)
                 _ind = self.state.live_indicators.get(symbol, {})
                 _pmod = _import_patterns()
-                blended = pattern_conv
-                regime = regime_info.get("regime", "unknown")
-                strategy = regime_info.get("strategy", "trend_following")
-                size_factor = regime_info.get("position_size_factor", 1.0)
+                symbol_regime = (regime_info.get("detail") or {}).get(symbol, {
+                    "regime": "unknown", "strategy": "none",
+                    "position_size_factor": 0.0, "adx": None,
+                })
+                regime = symbol_regime.get("regime", "unknown")
+                strategy = symbol_regime.get("strategy", "none")
+                size_factor = symbol_regime.get("position_size_factor", 0.0)
 
                 if strategy == "none":
                     logger.info(
                         "Signal [%s]: skipping entry — strategy=none, regime=%s (indicators unavailable)",
-                        symbol, regime_info.get("regime", "unknown"),
+                        symbol, regime,
                     )
-                    signal_dict = {"reason_blocked": "No strategy for regime (indicators unavailable)"}
+                    self._record_refusal("no strategy for symbol regime", symbol)
                     continue
+
+                # Raw price logic is observed separately from the learned
+                # pattern gate. It cannot place a normal-size order; it only
+                # creates a next-bar shadow outcome.
+                raw_conviction = float(pr.get("raw_price_conviction") or 0.0)
+                if strategy == "mean_reversion":
+                    raw_conviction = _pmod.mean_reversion_conviction(rsi_value)
+                raw_side = None
+                if raw_conviction >= SHADOW_SIGNAL_THRESHOLD:
+                    raw_side = "buy"
+                elif raw_conviction <= -SHADOW_SIGNAL_THRESHOLD:
+                    raw_side = "sell"
+
+                shadow_recorded = False
+                if raw_side and pr.get("pattern_hash"):
+                    try:
+                        signal_bar_ts = _epoch_timestamp(_ind.get("bar_timestamp"))
+                        if signal_bar_ts is None:
+                            raise ValueError("closed-bar timestamp unavailable")
+                        candidate = _import_shadow_forward().ShadowCandidate(
+                            symbol=symbol,
+                            signal_bar_ts=signal_bar_ts,
+                            side=raw_side,
+                            strategy=strategy,
+                            conviction=raw_conviction,
+                            regime=regime,
+                            pattern_hash=pr["pattern_hash"],
+                            rsi=float(rsi_value),
+                            adx=float(_ind.get("adx")),
+                            ema_short=float(_ind.get("ema_short")),
+                            ema_long=float(_ind.get("ema_long")),
+                            operationally_eligible=bool(
+                                market_open and not self.state.news_fetch_degraded),
+                        )
+                        shadow_recorded = self.shadow.record_candidate(candidate)
+                    except Exception as shadow_exc:
+                        logger.warning("SHADOW [%s]: candidate refused: %s", symbol, shadow_exc)
+                        self._record_refusal("shadow candidate invalid", symbol)
+
+                # Every normal-size production path requires learned pattern
+                # evidence. RSI extremes are hypotheses, not an exemption.
+                pattern_allowed = learned_pattern_allows_execution(
+                    pattern_conv, pr.get("resolved_samples", 0),
+                    self.min_conviction)
+                if not pattern_allowed:
+                    reason = (
+                        "pattern outcomes insufficient"
+                        if pr.get("resolved_samples", 0) < PATTERN_EXECUTION_MIN_RESOLVED
+                        else "pattern conviction too low"
+                    )
+                    self._record_refusal(reason, symbol)
 
                 side = None
                 action = "neutral"
                 mean_reversion_applied = False
+                blended = 0.0
 
-                if strategy == "mean_reversion":
+                if strategy == "mean_reversion" and pattern_allowed:
                     # Range-bound market → FADE RSI extremes instead of
                     # following the sentiment trend. Buy oversold dips, sell
                     # overbought spikes; ignore mid-range (no edge).
@@ -3417,7 +3665,7 @@ class Orchestrator:
                     # far RSI is from 50 (the extremity of the fade).
                     if mean_reversion_applied:
                         blended = _pmod.mean_reversion_conviction(rsi_value)
-                else:
+                elif pattern_allowed:
                     # Trending / transitioning / unknown → trend-following.
                     # Direction and strength come from price; the learned
                     # pattern conviction scales it rather than replacing it.
@@ -3452,6 +3700,13 @@ class Orchestrator:
                     "strategy": strategy,
                     "position_size_factor": size_factor,
                     "high_conviction": is_high_conviction,
+                    "raw_price_conviction": round(raw_conviction, 4),
+                    "raw_side": raw_side,
+                    "pattern_hash": pr.get("pattern_hash"),
+                    "pattern_label": pr.get("pattern_label"),
+                    "historical_samples": pr.get("historical_samples", 0),
+                    "resolved_samples": pr.get("resolved_samples", 0),
+                    "shadow_recorded": shadow_recorded,
                 }
 
                 # ---- Step 5: Execute (if autonomous AND market open) ----
@@ -3461,6 +3716,8 @@ class Orchestrator:
                     and side is not None
                     and market_open
                     and not self.state.news_fetch_degraded
+                    and not self.state.startup_recovery_blocked
+                    and not self.state.health_failed_this_session
                 ):
                     # Apply the regime position-size factor (e.g. ×0.5 in a
                     # transitioning market) around this single execution.
@@ -3469,7 +3726,9 @@ class Orchestrator:
                     try:
                         signal = trade_mod.TradeSignal(
                             symbol=symbol, action=action, conviction=blended,
-                            source="sentiment+pattern+regime",
+                            source="price+pattern+regime",
+                            stop_loss_pct=STOP_LOSS_PCT,
+                            take_profit_pct=TAKE_PROFIT_PCT,
                             reason=(
                                 f"Cycle #{cycle_num} {strategy} "
                                 f"(regime={regime}, rsi={rsi_value:.1f})"
@@ -3500,62 +3759,9 @@ class Orchestrator:
                     # Record pattern entry and track position
                     if exec_result.success and exec_result.filled_price:
                         try:
-                            # The signature must describe the trade that was
-                            # actually made. These EMAs were recomputed from
-                            # `daily_bars` -- a different dataset, at a
-                            # different resolution, capped at 50 rows, and
-                            # stale because the reconciliation writer was
-                            # rejecting every bar. The DECISION used the live
-                            # indicators from _fetch_ohlc. So the learner was
-                            # keyed on numbers the decision never saw, which
-                            # is the same failure as recording P&L with the
-                            # wrong sign: the record does not describe reality.
-                            #
-                            # Use the values the decision used. Fall back to
-                            # recomputation only if they are missing, and say
-                            # so, rather than silently substituting 0.0.
-                            _ind = (self.state.live_indicators or {}).get(symbol) or {}
-                            _ema_short = _ind.get("ema_short")
-                            _ema_long = _ind.get("ema_long")
-                            if _ema_short is None or _ema_long is None:
-                                logger.warning(
-                                    "Pattern signature for %s has no live EMAs; "
-                                    "falling back to stored bars. The signature "
-                                    "may not match the decision.", symbol)
-                                try:
-                                    _bars = self.patterns.db.get_recent_daily_bars(
-                                        symbol, limit=INDICATOR_FETCH_BARS)
-                                    _closes = [b["close"] for b in _bars]
-                                    _ema_short = self._compute_ema(_closes, EMA_SHORT_PERIOD) if _closes else 0.0
-                                    _ema_long = self._compute_ema(_closes, EMA_LONG_PERIOD) if _closes else 0.0
-                                except Exception:
-                                    _ema_short = 0.0
-                                    _ema_long = 0.0
-                            rid, phash = self.patterns.record_trade_pattern_and_track(
-                                symbol=symbol,
-                                sentiment_score=0.0,
-                                conviction_score=blended,
-                                rsi_value=50.0,
-                                ema_short=_ema_short,
-                                ema_long=_ema_long,
-                                entry_price=exec_result.filled_price,
-                                quantity=exec_result.filled_qty or exec_result.quantity,
-                                side=side,
-                                tier="signal",
-                            )
-                            signal_dict["pattern_record_id"] = rid
-                            signal_dict["pattern_hash"] = phash
-                            logger.info(
-                                "  📝 Pattern tracked [%s]: record_id=%d hash=%s",
-                                symbol, rid, phash,
-                            )
-                            # Update position state with full metadata
-                            self.trading.persist_filled_trade(
-                                symbol=symbol,
-                                pattern_id=rid,
-                                strategy=regime_info.get("strategy", "trend_following"),
-                                regime=regime_info.get("regime", "unknown"),
-                            )
+                            self._record_filled_pattern(
+                                symbol, side, raw_conviction, rsi_value, exec_result,
+                                signal_dict, strategy, regime, "signal")
                         except Exception as e:
                             logger.warning(
                                 "Failed to record pattern for %s: %s", symbol, e
@@ -3574,56 +3780,66 @@ class Orchestrator:
                             f"Conviction {abs(blended):.3f} < threshold "
                             f"{self.high_conviction}"
                         )
+                        self._record_refusal("actionable conviction too low", symbol)
+
+                # A cold-start pattern may qualify for exactly one PAPER share
+                # only after its separate shadow evidence clears every gate.
+                if not signal_dict.get("executed") and raw_side:
+                    try:
+                        allowed, why, evidence = self._paper_exploration_gate(
+                            pr.get("pattern_hash", ""), raw_side,
+                            raw_conviction, market_open, strategy, regime)
+                    except Exception as gate_exc:
+                        allowed, why, evidence = (
+                            False, "paper exploration gate unavailable: %s" % gate_exc,
+                            {"paper_exploration_eligible": False,
+                             "error": str(gate_exc)},
+                        )
+                    signal_dict["paper_exploration_evidence"] = evidence
+                    signal_dict["paper_exploration_allowed"] = allowed
+                    if allowed:
+                        exploration_signal = trade_mod.TradeSignal(
+                            symbol=symbol,
+                            action="buy",
+                            conviction=raw_conviction,
+                            quantity=1,
+                            source="shadow-promoted-paper-exploration",
+                            stop_loss_pct=STOP_LOSS_PCT,
+                            take_profit_pct=TAKE_PROFIT_PCT,
+                            reason=(
+                                f"Cycle #{cycle_num} promoted shadow pattern "
+                                f"{pr.get('pattern_hash')} ({strategy}, {regime})"
+                            ),
+                        )
+                        exploration_result = self.trading.execute(
+                            exploration_signal,
+                            overnight_risk=self.carries_overnight_risk())
+                        signal_dict["executed_paper_exploration"] = exploration_result.success
+                        if exploration_result.success:
+                            signal_dict["executed"] = True
+                            signal_dict["tier"] = "shadow_promoted_exploration"
+                        signal_dict["paper_exploration_order_id"] = exploration_result.order_id
+                        signal_dict["paper_exploration_status"] = exploration_result.status.value
+                        if exploration_result.success and exploration_result.filled_price:
+                            self.state.paper_exploration_trades_today += 1
+                            self.state.paper_exploration_total_trades += 1
+                            try:
+                                self._record_filled_pattern(
+                                    symbol, "buy", raw_conviction, rsi_value,
+                                    exploration_result, signal_dict, strategy, regime,
+                                    "shadow_promoted_exploration")
+                            except Exception as record_exc:
+                                logger.error(
+                                    "PAPER EXPLORATION [%s] filled but pattern "
+                                    "tracking failed: %s", symbol, record_exc)
+                            logger.warning(
+                                "PAPER EXPLORATION [%s]: bought exactly one share "
+                                "after shadow promotion", symbol)
+                    else:
+                        signal_dict["paper_exploration_blocked"] = why
+                        self._record_refusal("paper exploration evidence not ready", symbol)
 
                 result.setdefault("trade_signals", []).append(signal_dict)
-
-                # ---- Tier 2 (Exploration) Execution Path ----
-                if (
-                    self.state.is_autonomous
-                    and is_high_conviction
-                    and side is not None
-                    and market_open
-                    and not self.state.news_fetch_degraded
-                    and strategy == "mean_reversion"
-                    and self.state.tier_2_trades_today < TIER_2_DAILY_CAP
-                ):
-                    avg_adx = regime_info.get("adx", 0) or 0
-                    if avg_adx < TIER_2_ADX_CEILING and (
-                        rsi_value <= TIER_2_RSI_OVERSOLD or rsi_value >= TIER_2_RSI_OVERBOUGHT
-                    ):
-                        _orig_risk_t2 = self.trading.risk_per_trade
-                        self.trading.risk_per_trade = _orig_risk_t2 * TIER_2_RISK_FACTOR * size_factor * self.state.position_size_multiplier
-                        try:
-                            signal_t2 = trade_mod.TradeSignal(
-                                symbol=symbol, action=action, conviction=blended,
-                                source="sentiment+pattern+regime+tier2",
-                                reason=(
-                                    f"TIER2 Cycle #{cycle_num} {strategy} "
-                                    f"(regime={regime}, rsi={rsi_value:.1f}, adx={avg_adx:.1f})"
-                                ),
-                            )
-                            exec_result_t2 = self.trading.execute(
-                                signal_t2,
-                                overnight_risk=self.carries_overnight_risk())
-                        finally:
-                            self.trading.risk_per_trade = _orig_risk_t2
-                        signal_dict["tier"] = "exploration"
-                        signal_dict["executed_tier2"] = exec_result_t2.success
-                        signal_dict["order_id_tier2"] = exec_result_t2.order_id
-                        if exec_result_t2.success:
-                            self.state.tier_2_trades_today += 1
-                            self.state.tier_2_total_trades += 1
-                            logger.info(
-                                "  TIER2 [%s] Executed: %s (risk=%.4f, rsi=%.1f, adx=%.1f, t2_today=%d)",
-                                symbol, action, self.trading.risk_per_trade,
-                                rsi_value, avg_adx, self.state.tier_2_trades_today,
-                            )
-                        else:
-                            logger.info(
-                                "  TIER2 [%s] Rejected: %s (reason=%s)",
-                                symbol, action,
-                                exec_result_t2.error or "unknown",
-                            )
 
         except Exception as e:
             logger.error("Step 4/5 FAILED: %s", e)
@@ -3673,7 +3889,7 @@ class Orchestrator:
             try:
                 conn = self.patterns.db._connect()
                 rows = conn.execute(
-                    "SELECT entry_rsi, outcome FROM pattern_memory WHERE tier='exploration' AND outcome != 'pending'"
+                    "SELECT rsi_value, outcome FROM pattern_memory WHERE tier='exploration' AND outcome != 'pending'"
                 ).fetchall()
             except Exception:
                 rows = []
@@ -3772,6 +3988,7 @@ class Orchestrator:
         """Finalize a pipeline cycle with monitoring checks."""
         elapsed = round(time.time() - start, 3)
         result["elapsed_seconds"] = elapsed
+        result["refusals"] = dict(self.state.latest_refusals or {})
         self.state.last_cycle_time = time.time()
 
         # ---- Comprehensive decision audit entry (one JSON line per cycle) ----
@@ -4008,6 +4225,8 @@ class Orchestrator:
             "tier_2_total_trades": self.state.tier_2_total_trades,
             "tier_2_eval_cycle": self.state.tier_2_eval_cycle,
             "signal_trade_count": self.state.signal_trade_count,
+            "paper_exploration_trades_today": self.state.paper_exploration_trades_today,
+            "paper_exploration_total_trades": self.state.paper_exploration_total_trades,
         }
 
     # ------------------------------------------------------------------
@@ -4020,15 +4239,15 @@ class Orchestrator:
             sent = self.sentiment.analyze(headlines)
             agg_conv = sent.aggregate_conviction
 
-            # Compute real EMA values from recent daily bars
-            try:
-                _bars = self.patterns.db.get_recent_daily_bars(symbol, limit=50)
-                _closes = [b["close"] for b in _bars]
-                _ema_short = self._compute_ema(_closes, 20) if _closes else None
-                _ema_long = self._compute_ema(_closes, 50) if _closes else None
-            except Exception:
-                _ema_short = None
-                _ema_long = None
+            # Use the same real, closed-bar inputs as the autonomous cycle.
+            ohlc = self._fetch_ohlc(symbol, bars=INDICATOR_FETCH_BARS)
+            _closes = ohlc["closes"] if ohlc else []
+            pmod = _import_patterns()
+            _ema_short = pmod.compute_ema(_closes, EMA_SHORT_PERIOD) if _closes else None
+            _ema_long = pmod.compute_ema(_closes, EMA_LONG_PERIOD) if _closes else None
+            _prev_short = pmod.compute_ema(_closes[:-1], EMA_SHORT_PERIOD) if _closes else None
+            _prev_long = pmod.compute_ema(_closes[:-1], EMA_LONG_PERIOD) if _closes else None
+            _rsi = pmod.compute_rsi(_closes) if _closes else None
 
             if _ema_short is None or _ema_long is None:
                 logger.warning("evaluate_now: skipping %s — EMA unavailable", symbol)
@@ -4037,9 +4256,11 @@ class Orchestrator:
                 symbol=symbol,
                 sentiment_score=agg_conv,
                 conviction_score=agg_conv,
-                rsi_value=50.0,
+                rsi_value=_rsi,
                 ema_short=_ema_short,
                 ema_long=_ema_long,
+                prev_ema_short=_prev_short,
+                prev_ema_long=_prev_long,
             )
 
             return {
@@ -4091,6 +4312,10 @@ class Orchestrator:
             return False, "operator mode is KILLED"
         if self.state.mode is OrchestratorMode.DAILY_LOSS_LIMIT:
             return False, "daily loss limit mode active"
+        if self.state.startup_recovery_blocked:
+            return False, "startup recovery incomplete"
+        if self.state.health_failed_this_session:
+            return False, "pre-market health check failed"
         preflight = getattr(self.state, "preflight", None) or {}
         if preflight and not preflight.get("ok", True):
             return False, ("preflight failed: %s"
@@ -4150,6 +4375,21 @@ class Orchestrator:
     def get_state(self) -> dict:
         """Return current orchestrator state."""
         return self.state.to_dict()
+
+    def get_shadow_status(self) -> dict:
+        """Read-only progress toward evidence-gated paper exploration."""
+        try:
+            status = self.shadow.status()
+            status.update({
+                "minimum_completed_per_pattern": SHADOW_PROMOTION_MIN_TRADES,
+                "minimum_distinct_days_per_pattern": SHADOW_PROMOTION_MIN_DAYS,
+                "paper_only": True,
+                "quantity_cap": 1,
+                "long_only": True,
+            })
+            return status
+        except Exception as exc:
+            return {"error": str(exc), "paper_only": True, "quantity_cap": 1}
 
     def get_sentiment_data(self) -> dict:
         """Return latest sentiment analysis results."""
@@ -4846,6 +5086,12 @@ class Orchestrator:
             "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
             "stop_loss_pct": STOP_LOSS_PCT * 100.0,
             "take_profit_pct": TAKE_PROFIT_PCT * 100.0,
+            "shadow_signal_threshold": SHADOW_SIGNAL_THRESHOLD,
+            "shadow_promotion_min_trades": SHADOW_PROMOTION_MIN_TRADES,
+            "shadow_promotion_min_days": SHADOW_PROMOTION_MIN_DAYS,
+            "paper_exploration_daily_cap": PAPER_EXPLORATION_DAILY_CAP,
+            "paper_exploration_quantity_cap": 1,
+            "pattern_execution_min_resolved": PATTERN_EXECUTION_MIN_RESOLVED,
         }
 
     def get_stats(self) -> dict:

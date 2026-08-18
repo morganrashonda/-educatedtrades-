@@ -5311,12 +5311,15 @@ chk("DB2-7 weekend backfill respects the completed flag",
 # the DECISION used live indicators. The learner was keyed on numbers the
 # decision never saw: the same failure as recording P&L with the wrong sign.
 chk("DB2-4 the signature uses the indicators the decision used",
-    '_ind = (self.state.live_indicators or {}).get(symbol) or {}' in _db2_src)
-chk("DB2-5 a missing live indicator warns instead of silently using 0.0",
-    "Pattern signature for %s has no live EMAs" in _db2_src)
-chk("DB2-6 the fallback no longer hardcodes 50 bars or bare periods",
-    "get_recent_daily_bars(\n                                        symbol, limit=INDICATOR_FETCH_BARS)"
-    in _db2_src or "limit=INDICATOR_FETCH_BARS" in _db2_src)
+    'indicators = (self.state.live_indicators or {}).get(symbol) or {}'
+    in _db2_src)
+chk("DB2-5 a missing live indicator fails identity instead of inventing 0.0",
+    'raise RuntimeError("live EMA identity unavailable after fill")'
+    in _db2_src)
+chk("DB2-6 the signature includes previous EMAs and has no stale-bar fallback",
+    'prev_ema_short=indicators.get("prev_ema_short")' in _db2_src
+    and 'prev_ema_long=indicators.get("prev_ema_long")' in _db2_src
+    and "falling back to stored bars" not in _db2_src)
 
 
 # --- DH. The dashboard must not undo the backend's loopback bind -----------

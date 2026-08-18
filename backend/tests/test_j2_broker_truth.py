@@ -81,6 +81,8 @@ def test_startup_recovery_clears_block_after_retry(monkeypatch):
     class Trading:
         def __init__(self):
             self.calls = 0
+            self.position_truth = None
+            self.broker = types.SimpleNamespace(is_simulating=False)
 
         def get_broker_positions(self):
             self.calls += 1

@@ -180,8 +180,6 @@ DEFAULT_MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS"
 # stop. So an overnight position must be SIZED against the risk that can
 # actually materialise, not against the stop we hope to use.
 OVERNIGHT_RISK_PCT = float(os.environ.get("OVERNIGHT_RISK_PCT", "0.025"))
-#: Target move for the configured timeframe; slippage is judged against this.
-DEFAULT_TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.03"))
 #: Minimum gap between entries on the same symbol. Persisted via the ledger,
 #: so it survives a restart.
 ENTRY_COOLDOWN_S = int(os.environ.get("ENTRY_COOLDOWN_S", "300"))
@@ -189,8 +187,8 @@ ENTRY_COOLDOWN_S = int(os.environ.get("ENTRY_COOLDOWN_S", "300"))
 # Default position-safety thresholds (fraction of entry price).
 # Baseline per owner directive (2026-06-30): a -2.5% stop gives trades more
 # room to breathe, and a +3.0% target locks in profit (~1.2:1 reward/risk).
-DEFAULT_STOP_LOSS_PCT = 0.025          # close losers at -2.5%
-DEFAULT_TAKE_PROFIT_PCT = 0.03         # close winners at +3.0%
+DEFAULT_STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.025"))
+DEFAULT_TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.03"))
 
 # Execution lateness target (KPI: <2 seconds from signal to execution)
 TARGET_EXECUTION_LATENCY_S = 2.0
@@ -327,6 +325,20 @@ class TradeSignal:
             source=source,
             reason=" | ".join(parts),
         )
+
+
+def bounded_signal_quantity(calculated: int, requested: Optional[int]) -> int:
+    """Apply a smaller explicit quantity without bypassing risk sizing.
+
+    The normal risk engine remains the ceiling. This is used by the bounded
+    one-share paper exploration tier: it can reduce an order, never enlarge it.
+    """
+    calculated = int(calculated)
+    if requested is None:
+        return calculated
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+        raise ValueError("signal quantity must be a positive integer")
+    return min(calculated, requested)
 
 
 @dataclass
@@ -1348,7 +1360,8 @@ class TradingEngine:
                 # halting SPY because GLD is expensive throws away good trades.
                 if self.journal:
                     ok, why = self.journal.symbol_is_tradeable(
-                        signal.symbol, DEFAULT_TAKE_PROFIT_PCT * 100.0)
+                        signal.symbol,
+                        (signal.take_profit_pct or DEFAULT_TAKE_PROFIT_PCT) * 100.0)
                     if not ok:
                         logger.warning("Entry blocked for %s: %s", signal.symbol, why)
                         self.journal.blocked(
@@ -1393,6 +1406,10 @@ class TradingEngine:
                 stop_loss_pct=signal.stop_loss_pct,
                 overnight_risk=overnight_risk,
             )
+            try:
+                quantity = bounded_signal_quantity(quantity, signal.quantity)
+            except ValueError as exc:
+                return self._refuse(signal, "invalid quantity override", str(exc))
 
             if quantity <= 0:
                 return self._refuse(
