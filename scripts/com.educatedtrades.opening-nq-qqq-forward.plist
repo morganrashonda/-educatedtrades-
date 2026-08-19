@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.educatedtrades.opening-nq-qqq-forward</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/shaym/Downloads/Educated_Trades-main 5/scripts/run_opening_nq_qqq_forward.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/shaym/Downloads/Educated_Trades-main 5</string>
+
+  <!-- launchd uses the Mac's local America/Chicago timezone. 15:25 CT is
+       16:25 ET throughout daylight and standard time. The observer also
+       enforces its own 16:20 ET lower bound and Alpaca cash-session calendar. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>25</integer></dict>
+  </array>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/shaym/.educated-trades/research/logs/opening_nq_qqq_forward.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/shaym/.educated-trades/research/logs/opening_nq_qqq_forward.err.log</string>
+</dict>
+</plist>
