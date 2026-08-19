@@ -1,0 +1,3 @@
+# Optional isolated runtime for opening_gap_databento.py only.
+# Do not install this into Main 5's Python 3.9 backend venv.
+databento==0.78.0
