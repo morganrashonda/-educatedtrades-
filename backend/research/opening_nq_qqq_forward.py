@@ -43,6 +43,7 @@ THRESHOLD_PCT = 1.278097837
 DATASET = "GLBX.MDP3"
 NQ_SYMBOL = "NQ.v.0"
 QQQ_SYMBOL = "QQQ"
+QQQ_PRE_ENTRY_HMS = (9, 29, 55)
 API_ROOT = "https://hist.databento.com/v0"
 MAX_DATABENTO_COST_USD = 0.01
 MAX_DATABENTO_REQUESTS = 10
@@ -62,9 +63,27 @@ CONTRACT = {
     "same_instrument_required": True,
     "threshold_pct_strictly_greater_than": THRESHOLD_PCT,
     "direction": "fade",
+    "gap_strength": {
+        "definition": "abs(gap_pct) / threshold_pct",
+        "role": "continuous_forward_predictor",
+        "may_change_signal_direction": False,
+        "may_change_position_size": False,
+    },
     "qqq_symbol": QQQ_SYMBOL,
     "qqq_feed": "sip",
     "marks_et": {name: "%02d:%02d:%02d" % hms for name, hms in MARKS.items()},
+    "qqq_pre_entry_bbo": {
+        "mark_et": "%02d:%02d:%02d" % QQQ_PRE_ENTRY_HMS,
+        "max_quote_delay_seconds": 2.0,
+        "role": "optional_pre_entry_predictor",
+        "features": [
+            "midpoint", "spread", "spread_bps", "queue_imbalance",
+            "gap_aligned_queue_imbalance", "fade_aligned_queue_imbalance",
+        ],
+        "source_failure_policy": "record_refusal_without_altering_primary_result",
+        "may_affect_signal_or_primary_outcome": False,
+        "may_change_position_size": False,
+    },
     "max_quote_delay_seconds": 2.0,
     "primary_extra_slippage_per_share": PRIMARY_SLIPPAGE_DOLLARS_PER_SHARE,
     "all_session_qqq_baseline": True,
@@ -73,10 +92,12 @@ CONTRACT = {
         "schema": "mbp-1",
         "window_et": ["09:29:55", "09:32:06"],
         "diagnostic_windows_et": [
+            ["09:29:55", "09:30:01"],
             ["09:30:01", "09:30:11"],
             ["09:30:01", "09:30:31"],
             ["09:30:01", "09:32:01"],
         ],
+        "pre_entry_window_et": ["09:29:55", "09:30:01"],
         "may_affect_signal_or_primary_outcome": False,
     },
 }
@@ -213,10 +234,59 @@ def qqq_null_baseline(marks: dict[str, EquityQuote]) -> dict:
 
 
 ORDERFLOW_WINDOWS = {
+    "pre_entry_6_seconds": ((9, 29, 55), (9, 30, 1)),
     "first_10_seconds": ((9, 30, 1), (9, 30, 11)),
     "first_30_seconds": ((9, 30, 1), (9, 30, 31)),
     "primary_120_seconds": ((9, 30, 1), (9, 32, 1)),
 }
+
+
+def gap_prediction_features(gap_pct: float) -> dict:
+    """Return the frozen, outcome-free gap predictor recorded at 09:29 ET."""
+
+    gap_pct = float(gap_pct)
+    if not math.isfinite(gap_pct):
+        raise AuditRefusal("gap percentage is non-finite")
+    return {
+        "absolute_gap_pct": abs(gap_pct),
+        "gap_strength_ratio": abs(gap_pct) / THRESHOLD_PCT,
+        "gap_side": "up" if gap_pct > 0 else "down" if gap_pct < 0 else "flat",
+        "known_by_et": "09:29:00",
+        "continuous_predictor_only": True,
+        "may_change_signal_direction": False,
+        "may_change_position_size": False,
+    }
+
+
+def qqq_pre_entry_features(quote: EquityQuote, gap_pct: float) -> dict:
+    """Return normalized QQQ BBO measurements known before the frozen entry."""
+
+    gap_pct = float(gap_pct)
+    if not math.isfinite(gap_pct):
+        raise AuditRefusal("gap percentage is non-finite")
+    midpoint = (quote.bid + quote.ask) / 2.0
+    spread = quote.ask - quote.bid
+    total_size = quote.bid_size + quote.ask_size
+    if midpoint <= 0 or total_size <= 0:
+        raise AuditRefusal("QQQ pre-entry BBO cannot be normalized")
+    queue_imbalance = (quote.bid_size - quote.ask_size) / total_size
+    gap_direction = 1 if gap_pct > 0 else -1 if gap_pct < 0 else 0
+    return {
+        "status": "COMPLETE",
+        "mark_et": "%02d:%02d:%02d" % QQQ_PRE_ENTRY_HMS,
+        "observed_at": quote.source_timestamp,
+        "midpoint": midpoint,
+        "spread": spread,
+        "spread_bps": spread / midpoint * 10_000.0,
+        "queue_imbalance": queue_imbalance,
+        "gap_aligned_queue_imbalance": gap_direction * queue_imbalance,
+        "fade_aligned_queue_imbalance": -gap_direction * queue_imbalance,
+        "available_before_entry": True,
+        "contains_post_entry_information": False,
+        "predictor_only": True,
+        "may_affect_signal_or_primary_outcome": False,
+        "may_change_position_size": False,
+    }
 
 
 def summarize_orderflow(rows: list[dict], day: date, fade_direction: int) -> dict:
@@ -258,6 +328,12 @@ def summarize_orderflow(rows: list[dict], day: date, fade_direction: int) -> dic
         gap_extensions = [gap_direction * (mid - open_mid) for mid in mids]
         maximum_extension = max(gap_extensions)
         summaries[name] = {
+            "window_et": [
+                "%02d:%02d:%02d" % start_hms,
+                "%02d:%02d:%02d" % end_hms,
+            ],
+            "available_before_entry": end <= _at(day, (9, 30, 1)),
+            "contains_post_entry_information": start >= _at(day, (9, 30, 1)),
             "covered_seconds": len(selected),
             "events": sum(int(row.get("events") or 0) for row in selected),
             "trades": sum(int(row.get("trades") or 0) for row in selected),
@@ -290,6 +366,7 @@ def summarize_orderflow(rows: list[dict], day: date, fade_direction: int) -> dic
         "status": "COMPLETE",
         "diagnostic_only": True,
         "may_affect_signal_or_primary_outcome": False,
+        "pre_entry_prediction_inputs": summaries["pre_entry_6_seconds"],
         "windows": summaries,
     }
 
@@ -435,6 +512,9 @@ class ForwardStore:
         no_signal_long_net = []
         no_signal_short_net = []
         orderflow_counts = {}
+        qqq_pre_entry_counts = {}
+        gap_strength_outcomes = []
+        qqq_queue_outcomes = []
         for row in payload_rows:
             payload = json.loads(row["payload_json"])
             baseline = payload.get("qqq_null_baseline", {}).get("entry", {})
@@ -451,9 +531,59 @@ class ForwardStore:
             orderflow_status = payload.get("orderflow_diagnostics", {}).get("status")
             if orderflow_status:
                 orderflow_counts[orderflow_status] = orderflow_counts.get(orderflow_status, 0) + 1
+            predictor = payload.get("prediction_features", {})
+            qqq_pre_entry = predictor.get("qqq_pre_entry_bbo", {})
+            qqq_pre_entry_status = qqq_pre_entry.get("status")
+            if qqq_pre_entry_status:
+                qqq_pre_entry_counts[qqq_pre_entry_status] = (
+                    qqq_pre_entry_counts.get(qqq_pre_entry_status, 0) + 1
+                )
+            if row["status"] == "COMPLETE":
+                strength = predictor.get("gap_strength_ratio")
+                outcome = payload.get("primary_net_per_share")
+                if strength is not None and outcome is not None:
+                    gap_strength_outcomes.append((float(strength), float(outcome)))
+                queue = qqq_pre_entry.get("fade_aligned_queue_imbalance")
+                if queue is not None and outcome is not None:
+                    qqq_queue_outcomes.append((float(queue), float(outcome)))
 
         def average(items: list[float]) -> float | None:
             return sum(items) / len(items) if items else None
+
+        def rank(items: list[float]) -> list[float]:
+            ordered = sorted(enumerate(items), key=lambda pair: pair[1])
+            result = [0.0] * len(items)
+            index = 0
+            while index < len(ordered):
+                end = index + 1
+                while end < len(ordered) and ordered[end][1] == ordered[index][1]:
+                    end += 1
+                value = (index + 1 + end) / 2.0
+                for position in range(index, end):
+                    result[ordered[position][0]] = value
+                index = end
+            return result
+
+        def correlation(xs: list[float], ys: list[float]) -> float | None:
+            if len(xs) < 3:
+                return None
+            x_mean = sum(xs) / len(xs)
+            y_mean = sum(ys) / len(ys)
+            numerator = sum(
+                (x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)
+            )
+            denominator = math.sqrt(
+                sum((x - x_mean) ** 2 for x in xs)
+                * sum((y - y_mean) ** 2 for y in ys)
+            )
+            return numerator / denominator if denominator else None
+
+        strengths = [item[0] for item in gap_strength_outcomes]
+        strength_outcomes = [item[1] for item in gap_strength_outcomes]
+        strength_correlation = correlation(rank(strengths), rank(strength_outcomes))
+        qqq_queues = [item[0] for item in qqq_queue_outcomes]
+        qqq_queue_results = [item[1] for item in qqq_queue_outcomes]
+        qqq_queue_correlation = correlation(rank(qqq_queues), rank(qqq_queue_results))
 
         return {
             "contract_sha256": CONTRACT_SHA256,
@@ -475,6 +605,34 @@ class ForwardStore:
                 "direction_selected": False,
             },
             "orderflow_diagnostic_counts": orderflow_counts,
+            "qqq_pre_entry_diagnostic_counts": qqq_pre_entry_counts,
+            "gap_strength_forward_evidence": {
+                "n": len(gap_strength_outcomes),
+                "spearman_with_primary_net_per_share": strength_correlation,
+                "initial_review_minimum": 30,
+                "status": (
+                    "MEASURED" if len(gap_strength_outcomes) >= 30
+                    else "INSUFFICIENT_FORWARD_SAMPLE"
+                ),
+                "threshold_search_permitted": False,
+                "may_change_position_size": False,
+                "execution_authorized": False,
+            },
+            "qqq_pre_entry_forward_evidence": {
+                "n": len(qqq_queue_outcomes),
+                "spearman_fade_aligned_queue_imbalance_with_primary_net_per_share": (
+                    qqq_queue_correlation
+                ),
+                "initial_review_minimum": 30,
+                "status": (
+                    "MEASURED" if len(qqq_queue_outcomes) >= 30
+                    else "INSUFFICIENT_FORWARD_SAMPLE"
+                ),
+                "univariate_descriptive_only": True,
+                "threshold_search_permitted": False,
+                "may_change_position_size": False,
+                "execution_authorized": False,
+            },
             "execution_authorized": False,
         }
 
@@ -798,6 +956,11 @@ class AlpacaQQQProvider:
             for name, hms in MARKS.items()
         }
 
+    def pre_entry_mark(self, day: date) -> EquityQuote:
+        return _request_first_quote(
+            self.client, self.headers, day, QQQ_PRE_ENTRY_HMS, self.limiter
+        )
+
 
 def _base_payload(day: date, status: str) -> dict:
     return {
@@ -865,6 +1028,7 @@ def observe_session(
         return payload
     gap_pct = (current.close / prior.close - 1.0) * 100.0
     payload["gap_pct"] = gap_pct
+    payload["prediction_features"] = gap_prediction_features(gap_pct)
     try:
         marks = qqq_provider.marks(day)
         if set(marks) != set(MARKS):
@@ -878,6 +1042,23 @@ def observe_session(
         return payload
     payload["qqq_marks"] = {name: _quote_payload(marks[name]) for name in MARKS}
     payload["qqq_null_baseline"] = qqq_null_baseline(marks)
+    try:
+        pre_entry_quote = qqq_provider.pre_entry_mark(day)
+        _validate_quote(
+            pre_entry_quote, day, QQQ_PRE_ENTRY_HMS, "QQQ pre-entry BBO"
+        )
+        payload["qqq_pre_entry_bbo"] = _quote_payload(pre_entry_quote)
+        payload["prediction_features"]["qqq_pre_entry_bbo"] = (
+            qqq_pre_entry_features(pre_entry_quote, gap_pct)
+        )
+    except Exception as exc:
+        payload["prediction_features"]["qqq_pre_entry_bbo"] = {
+            "status": "REFUSED_QQQ_PRE_ENTRY_SOURCE",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "predictor_only": True,
+            "may_affect_signal_or_primary_outcome": False,
+            "may_change_position_size": False,
+        }
     if abs(gap_pct) <= THRESHOLD_PCT:
         payload["status"] = "NO_SIGNAL"
         store.record(payload, now)
@@ -990,6 +1171,9 @@ def main() -> int:
         "session_date": result["session_date"],
         "status": result["status"],
         "gap_pct": result.get("gap_pct"),
+        "gap_strength_ratio": (
+            result.get("prediction_features", {}).get("gap_strength_ratio")
+        ),
         "primary_net_per_share": result.get("primary_net_per_share"),
         "databento_estimated_cost_usd": nq.estimated_cost_usd,
         "databento_requests": nq.request_count,

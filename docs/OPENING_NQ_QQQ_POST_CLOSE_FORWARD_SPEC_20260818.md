@@ -4,9 +4,10 @@ Status: frozen, research-only observation. This document does not authorize
 Tier 3, learning writes, paper orders, live orders, or changes to the running
 coordinator.
 
-Frozen: 2026-08-18. The all-session baseline and qualifying-session order-flow
-diagnostics were added on 2026-08-18, still before the first eligible cash
-session. The first eligible cash session is 2026-08-19.
+Frozen: 2026-08-18. The all-session baseline, continuous gap-strength record,
+09:29:55 QQQ pre-entry BBO, pre-entry order-flow window, and qualifying-session
+post-entry order-flow diagnostics were added on 2026-08-18, still before the
+first eligible cash session. The first eligible cash session is 2026-08-19.
 
 ## Purpose
 
@@ -30,6 +31,9 @@ after 2026-08-19, because the complete rule was frozen before that session.
   mismatch refuses the session.
 - `gap_pct = (decision_close / prior_close - 1) * 100`.
 - Trigger only when `abs(gap_pct) > 1.278097837`. Equality is no signal.
+- Record `gap_strength_ratio = abs(gap_pct) / 1.278097837` on every valid
+  session. It is a continuous forward predictor for later evaluation; it
+  cannot alter direction, eligibility, or position size during collection.
 - Positive gap means short QQQ; negative gap means long QQQ.
 - No candle shape, QQQ price, news, macro label, order flow, or later price may
   alter the trigger or direction.
@@ -48,6 +52,21 @@ after 2026-08-19, because the complete rule was frozen before that session.
   the observed spread crossing. The 5- and 10-second entries are diagnostics.
 - Missing, malformed, locked, crossed, or late quotes refuse the signal session.
   No trade, midpoint, or bar substitution is permitted.
+
+## Optional pre-entry QQQ BBO predictor
+
+For every valid cash session, separately request the first valid QQQ SIP quote
+at or after 09:29:55 ET and no more than two seconds late. Record its midpoint,
+spread, spread in basis points, queue imbalance, and queue imbalance signed
+toward both the NQ gap and frozen fade directions. The quote and every derived
+feature are known before the frozen 09:30:01 entry.
+
+This source is deliberately isolated from the four mandatory QQQ execution
+marks. Missing, malformed, locked, crossed, or late pre-entry BBO data is
+recorded as `REFUSED_QQQ_PRE_ENTRY_SOURCE`; it cannot refuse an otherwise valid
+session, create or remove a signal, change direction, alter the primary result,
+or change position size. The standalone BBO is not called a futures-versus-cash
+fair-value residual because no prior QQQ reference is frozen in this packet.
 
 ## All-session QQQ null baseline
 
@@ -78,23 +97,27 @@ Only sessions that satisfy the unchanged NQ gap trigger request Databento
 actual instrument ID must match the 09:28 signal bar. Raw data is compressed
 locally with its uncompressed SHA-256 provenance hash.
 
-The existing validated one-second MBP-1 extractor produces three fixed,
-non-overlapping-lookahead summaries beginning at 09:30:01 ET:
+The existing validated one-second MBP-1 extractor produces one fixed pre-entry
+summary and three post-entry explanatory summaries:
 
+- pre-entry predictor: `[09:29:55, 09:30:01)`;
 - first 10 seconds: `[09:30:01, 09:30:11)`;
 - first 30 seconds: `[09:30:01, 09:30:31)`; and
 - primary horizon: `[09:30:01, 09:32:01)`.
 
-Each summary records event/trade counts, aggressive buy and sell volume,
+Each summary records its exact time boundary, whether it was available before
+entry, event/trade counts, aggressive buy and sell volume,
 signed trade imbalance, OFI, mean depth, depth-normalized OFI, queue imbalance,
 spread, microprice displacement, gap-direction aggressive effort, price
 progress per aggressive contract, gap extension, reversal from the extreme,
 and the same quantities signed toward the frozen fade direction.
 
-These are explanatory measurements only. There is no absorption threshold,
-order-flow filter, score, confirmation requirement, or veto. Missing or
-over-budget order flow is retained as a diagnostic refusal while the QQQ
-primary result remains complete and unchanged.
+Only the six-second pre-entry summary is eligible for later evaluation as a
+predictor. The other summaries contain post-entry information and are labeled
+accordingly. All four remain measurement-only: there is no absorption
+threshold, order-flow filter, score, confirmation requirement, or veto.
+Missing or over-budget order flow is retained as a diagnostic refusal while
+the QQQ primary result remains complete and unchanged.
 
 ## Collection boundary
 
@@ -104,7 +127,8 @@ primary result remains complete and unchanged.
 - The session date is explicit. The collector does not automatically sweep old
   dates and cannot import pre-freeze history.
 - Historical requests are minimized to one Alpaca calendar lookup, two exact NQ
-  one-minute marks, four two-second QQQ quote windows, and, only for a
+  one-minute marks, four mandatory two-second QQQ quote windows, one optional
+  pre-entry two-second QQQ quote window, and, only for a
   qualifying signal, one 131-second NQ MBP-1 window.
 - Every Databento request receives a cost preflight. One run has a hard $0.01
   bar-data cap and a ten-request ceiling. A qualifying session's optional
@@ -133,6 +157,13 @@ primary result remains complete and unchanged.
 
 Report all post-freeze sessions, including no-signal and refused days. Initial
 review remains 30 completed qualifying signals; stronger review remains 60.
+At review, report the rank correlation between frozen gap strength and primary
+net QQQ outcome, plus the univariate rank correlation between fade-aligned QQQ
+pre-entry queue imbalance and that outcome. The latter is descriptive until it
+improves on gap strength alone in an untouched partition. Threshold searches
+and size changes are prohibited during collection. Any pre-entry order-flow
+relationship must also improve on gap strength alone in an untouched partition
+before it can be considered predictive.
 Any paper trial requires a separate specification, independent review, and
 explicit owner authorization. No result produced by this observer can enable
 execution automatically.

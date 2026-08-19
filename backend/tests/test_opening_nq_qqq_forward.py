@@ -18,9 +18,12 @@ from backend.research.opening_nq_qqq_forward import (
     MAX_ORDERFLOW_BYTES,
     MIN_FREE_DISK_HEADROOM_BYTES,
     NQBar,
+    QQQ_PRE_ENTRY_HMS,
     THRESHOLD_PCT,
     _base_payload,
+    gap_prediction_features,
     observe_session,
+    qqq_pre_entry_features,
     summarize_orderflow,
 )
 
@@ -65,6 +68,10 @@ def qqq_marks(day=DAY, short=False):
     return {name: quote(day, *times[name], *prices[name]) for name in times}
 
 
+def qqq_pre_entry_quote(day=DAY):
+    return quote(day, *QQQ_PRE_ENTRY_HMS, 99.98, 100.00)
+
+
 class NQProvider:
     def __init__(
         self, prior_close=100.0, current_close=98.0, prior_id=42, current_id=42,
@@ -96,10 +103,18 @@ class NQProvider:
 
 
 class QQQProvider:
-    def __init__(self, marks=None, prior_close_time=time(16, 0)):
+    def __init__(
+        self, marks=None, prior_close_time=time(16, 0), pre_entry=None,
+        pre_entry_error=None,
+    ):
         self.value = marks if marks is not None else qqq_marks()
         self.calls = 0
         self.prior_close_time = prior_close_time
+        self.pre_entry_value = (
+            pre_entry if pre_entry is not None else qqq_pre_entry_quote()
+        )
+        self.pre_entry_error = pre_entry_error
+        self.pre_entry_calls = 0
 
     def session_context(self, day):
         from backend.research.opening_nq_qqq_forward import CashSessionContext
@@ -108,6 +123,12 @@ class QQQProvider:
     def marks(self, day):
         self.calls += 1
         return self.value
+
+    def pre_entry_mark(self, day):
+        self.pre_entry_calls += 1
+        if self.pre_entry_error:
+            raise self.pre_entry_error
+        return self.pre_entry_value
 
 
 class ExplodingProvider:
@@ -333,8 +354,14 @@ def test_orderflow_download_is_capped_validated_compressed_and_reusable(tmp_path
     assert result["diagnostic_only"] is True
     assert result["may_affect_signal_or_primary_outcome"] is False
     assert set(result["windows"]) == {
-        "first_10_seconds", "first_30_seconds", "primary_120_seconds",
+        "pre_entry_6_seconds", "first_10_seconds", "first_30_seconds",
+        "primary_120_seconds",
     }
+    pre_entry = result["pre_entry_prediction_inputs"]
+    assert pre_entry == result["windows"]["pre_entry_6_seconds"]
+    assert pre_entry["covered_seconds"] == 6
+    assert pre_entry["available_before_entry"] is True
+    assert pre_entry["contains_post_entry_information"] is False
     provenance = result["provenance"]
     assert provenance["records"] == 131
     assert provenance["estimated_new_cost_usd"] == pytest.approx(0.10)
@@ -390,7 +417,30 @@ def test_nonqualifying_day_records_both_direction_qqq_null_baseline(tmp_path):
     result = observe_session(DAY, store, nq, qqq, AFTER_CLOSE)
     assert result["status"] == "NO_SIGNAL"
     assert result["gap_pct"] == pytest.approx(1.0)
+    expected_features = gap_prediction_features(1.0)
+    assert result["prediction_features"]["absolute_gap_pct"] == pytest.approx(
+        expected_features["absolute_gap_pct"]
+    )
+    assert result["prediction_features"]["gap_strength_ratio"] == pytest.approx(
+        expected_features["gap_strength_ratio"]
+    )
+    assert result["prediction_features"]["gap_strength_ratio"] < 1.0
+    assert result["prediction_features"]["may_change_position_size"] is False
     assert qqq.calls == 1
+    assert qqq.pre_entry_calls == 1
+    pre_entry = result["prediction_features"]["qqq_pre_entry_bbo"]
+    assert pre_entry == qqq_pre_entry_features(qqq.pre_entry_value, result["gap_pct"])
+    assert pre_entry["status"] == "COMPLETE"
+    assert pre_entry["mark_et"] == "09:29:55"
+    assert pre_entry["observed_at"] == result["qqq_pre_entry_bbo"]["ts"]
+    assert pre_entry["spread"] == pytest.approx(0.02)
+    assert pre_entry["spread_bps"] == pytest.approx(2.00020002)
+    assert pre_entry["queue_imbalance"] == pytest.approx(-1 / 21)
+    assert pre_entry["gap_aligned_queue_imbalance"] == pytest.approx(-1 / 21)
+    assert pre_entry["fade_aligned_queue_imbalance"] == pytest.approx(1 / 21)
+    assert pre_entry["available_before_entry"] is True
+    assert pre_entry["contains_post_entry_information"] is False
+    assert pre_entry["may_affect_signal_or_primary_outcome"] is False
     baseline = result["qqq_null_baseline"]
     assert baseline["entry"]["long_gross_per_share"] == pytest.approx(0.18)
     assert baseline["entry"]["short_gross_per_share"] == pytest.approx(-0.22)
@@ -434,6 +484,13 @@ def test_long_crosses_ask_to_bid_and_subtracts_primary_cost(tmp_path):
     assert result["primary_net_per_share"] == pytest.approx(0.16)
     assert result["delayed_5_gross_per_share"] == pytest.approx(0.14)
     assert result["delayed_10_gross_per_share"] == pytest.approx(0.09)
+    assert result["prediction_features"]["absolute_gap_pct"] == pytest.approx(2.0)
+    assert result["prediction_features"]["gap_strength_ratio"] == pytest.approx(
+        2.0 / THRESHOLD_PCT
+    )
+    assert result["prediction_features"]["qqq_pre_entry_bbo"][
+        "fade_aligned_queue_imbalance"
+    ] == pytest.approx(-1 / 21)
     assert result["execution_authorized"] is False
 
 
@@ -483,6 +540,43 @@ def test_orderflow_outage_preserves_complete_qqq_primary(tmp_path):
     assert diagnostic["may_affect_signal_or_primary_outcome"] is False
 
 
+def test_pre_entry_qqq_outage_preserves_frozen_primary_and_signal(tmp_path):
+    qqq = QQQProvider(pre_entry_error=RuntimeError("premarket quote unavailable"))
+    result = observe_session(DAY, make_store(tmp_path), NQProvider(), qqq, AFTER_CLOSE)
+    assert result["status"] == "COMPLETE"
+    assert result["direction"] == 1
+    assert result["primary_net_per_share"] == pytest.approx(0.16)
+    assert "qqq_pre_entry_bbo" not in result
+    diagnostic = result["prediction_features"]["qqq_pre_entry_bbo"]
+    assert diagnostic["status"] == "REFUSED_QQQ_PRE_ENTRY_SOURCE"
+    assert "premarket quote unavailable" in diagnostic["reason"]
+    assert diagnostic["may_affect_signal_or_primary_outcome"] is False
+    assert diagnostic["may_change_position_size"] is False
+
+
+def test_post_entry_qqq_poison_cannot_change_pre_entry_predictor_or_direction(tmp_path):
+    normal = observe_session(
+        DAY, ForwardStore(tmp_path / "normal.sqlite3"), NQProvider(), QQQProvider(),
+        AFTER_CLOSE,
+    )
+    poisoned_marks = qqq_marks()
+    poisoned_marks.update({
+        "entry": quote(DAY, 9, 30, 1, 500.00, 500.02),
+        "delayed_5": quote(DAY, 9, 30, 6, 700.00, 700.02),
+        "delayed_10": quote(DAY, 9, 30, 11, 900.00, 900.02),
+        "exit": quote(DAY, 9, 32, 1, 1_000.00, 1_000.02),
+    })
+    poisoned = observe_session(
+        DAY, ForwardStore(tmp_path / "poisoned.sqlite3"), NQProvider(),
+        QQQProvider(poisoned_marks), AFTER_CLOSE,
+    )
+    assert poisoned["direction"] == normal["direction"] == 1
+    assert poisoned["prediction_features"]["qqq_pre_entry_bbo"] == normal[
+        "prediction_features"
+    ]["qqq_pre_entry_bbo"]
+    assert poisoned["primary_net_per_share"] != normal["primary_net_per_share"]
+
+
 def test_no_signal_never_purchases_orderflow(tmp_path):
     nq = NQProvider(current_close=101.0, orderflow_error=AssertionError("must not run"))
     result = observe_session(
@@ -495,7 +589,7 @@ def test_no_signal_never_purchases_orderflow(tmp_path):
 
 def test_frozen_orderflow_windows_report_effort_pressure_and_reversal():
     rows = []
-    for second in range(1, 121):
+    for second in range(-5, 121):
         ts = at(DAY, 9, 30, 0) + timedelta(seconds=second)
         open_mid = 100.0 + second * 0.01
         rows.append({
@@ -508,6 +602,11 @@ def test_frozen_orderflow_windows_report_effort_pressure_and_reversal():
             "open_mid": open_mid, "close_mid": open_mid + 0.005,
         })
     result = summarize_orderflow(rows, DAY, fade_direction=-1)
+    pre_entry = result["pre_entry_prediction_inputs"]
+    assert pre_entry["covered_seconds"] == 6
+    assert pre_entry["window_et"] == ["09:29:55", "09:30:01"]
+    assert pre_entry["available_before_entry"] is True
+    assert pre_entry["contains_post_entry_information"] is False
     first = result["windows"]["first_10_seconds"]
     assert first["covered_seconds"] == 10
     assert first["events"] == 50
@@ -518,12 +617,14 @@ def test_frozen_orderflow_windows_report_effort_pressure_and_reversal():
     assert first["depth_normalized_ofi"] == pytest.approx(3.0)
     assert first["fade_aligned_depth_normalized_ofi"] == pytest.approx(-3.0)
     assert first["gap_direction_progress_per_contract"] > 0
+    assert first["available_before_entry"] is False
+    assert first["contains_post_entry_information"] is True
     assert result["may_affect_signal_or_primary_outcome"] is False
 
 
 def test_orderflow_rows_after_primary_horizon_cannot_change_diagnostics():
     rows = []
-    for second in range(1, 126):
+    for second in range(-5, 126):
         ts = at(DAY, 9, 30, 0) + timedelta(seconds=second)
         rows.append({
             "timestamp_utc": ts.astimezone(timezone.utc).isoformat(),
@@ -537,8 +638,77 @@ def test_orderflow_rows_after_primary_horizon_cannot_change_diagnostics():
             "close_mid": 101.0 if second <= 120 else 10_000.0,
         })
     with_future = summarize_orderflow(rows, DAY, fade_direction=-1)
-    without_future = summarize_orderflow(rows[:120], DAY, fade_direction=-1)
+    without_future = summarize_orderflow(rows[:126], DAY, fade_direction=-1)
     assert with_future == without_future
+
+
+def test_post_entry_poison_cannot_change_pre_entry_prediction_inputs():
+    rows = []
+    for second in range(-5, 121):
+        ts = at(DAY, 9, 30, 0) + timedelta(seconds=second)
+        poisoned = second >= 1
+        rows.append({
+            "timestamp_utc": ts.astimezone(timezone.utc).isoformat(),
+            "events": 1, "trades": 1,
+            "buy_volume": 1_000_000.0 if poisoned else 2.0,
+            "sell_volume": 0.0 if poisoned else 1.0,
+            "ofi": 1_000_000.0 if poisoned else 3.0,
+            "mean_depth": 10.0, "mean_queue_imbalance": 0.1,
+            "mean_spread": 0.25, "mean_microprice_displacement": 0.01,
+            "open_mid": 10_000.0 if poisoned else 100.0,
+            "close_mid": 20_000.0 if poisoned else 100.01,
+        })
+    poisoned = summarize_orderflow(rows, DAY, fade_direction=-1)
+    clean_pre_entry = summarize_orderflow(rows[:6] + [
+        dict(row, buy_volume=1.0, ofi=1.0, open_mid=100.0, close_mid=100.0)
+        for row in rows[6:]
+    ], DAY, fade_direction=-1)
+    assert poisoned["pre_entry_prediction_inputs"] == clean_pre_entry[
+        "pre_entry_prediction_inputs"
+    ]
+
+
+def test_summary_reports_gap_strength_only_after_forward_sample(tmp_path):
+    store = make_store(tmp_path)
+    observations = [
+        (date(2026, 8, 19), 1.4, -0.05, -0.5),
+        (date(2026, 8, 20), 1.8, 0.10, 0.0),
+        (date(2026, 8, 21), 2.2, 0.25, 0.5),
+    ]
+    for session_day, gap, outcome, queue in observations:
+        payload = _base_payload(session_day, "COMPLETE")
+        prediction_features = gap_prediction_features(gap)
+        prediction_features["qqq_pre_entry_bbo"] = {
+            "status": "COMPLETE",
+            "fade_aligned_queue_imbalance": queue,
+            "may_affect_signal_or_primary_outcome": False,
+            "may_change_position_size": False,
+        }
+        payload.update({
+            "gap_pct": gap,
+            "direction": -1,
+            "gross_per_share": outcome + 0.02,
+            "primary_net_per_share": outcome,
+            "prediction_features": prediction_features,
+        })
+        assert store.record(payload, AFTER_CLOSE + timedelta(days=(session_day - DAY).days))
+    evidence = store.summary()["gap_strength_forward_evidence"]
+    assert evidence["n"] == 3
+    assert evidence["spearman_with_primary_net_per_share"] == pytest.approx(1.0)
+    assert evidence["status"] == "INSUFFICIENT_FORWARD_SAMPLE"
+    assert evidence["threshold_search_permitted"] is False
+    assert evidence["may_change_position_size"] is False
+    assert evidence["execution_authorized"] is False
+    qqq_evidence = store.summary()["qqq_pre_entry_forward_evidence"]
+    assert qqq_evidence["n"] == 3
+    assert qqq_evidence[
+        "spearman_fade_aligned_queue_imbalance_with_primary_net_per_share"
+    ] == pytest.approx(1.0)
+    assert qqq_evidence["status"] == "INSUFFICIENT_FORWARD_SAMPLE"
+    assert qqq_evidence["univariate_descriptive_only"] is True
+    assert qqq_evidence["threshold_search_permitted"] is False
+    assert qqq_evidence["may_change_position_size"] is False
+    assert store.summary()["qqq_pre_entry_diagnostic_counts"] == {"COMPLETE": 3}
 
 
 def test_roll_transition_is_explicit_refusal_and_never_fetches_qqq(tmp_path):
