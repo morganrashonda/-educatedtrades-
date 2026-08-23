@@ -170,6 +170,12 @@ def test_opening_60s_ofi_candidates_are_measurement_only() -> None:
     assert opening["ofi_score"] == pytest.approx(0.8)
     assert opening["forward_mid_move_points"] == pytest.approx(0.25)
     assert opening["forward_direction"] == 1
+    linking = opening["linking_features"]
+    assert linking["flow_score"] == pytest.approx(2 / 3)
+    assert linking["ofi_persistence"] == pytest.approx(1.0)
+    assert linking["queue_imbalance_mean"] == pytest.approx(0.1)
+    assert linking["microprice_displacement_mean"] == pytest.approx(0.05)
+    assert linking["three_way_flow_queue_micro_agree"] is True
     assert opening["candidates"]["ofi_direction_all"] == {
         "eligible": True,
         "side": 1,

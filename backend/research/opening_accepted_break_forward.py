@@ -70,6 +70,7 @@ CONTRACT = {
     "algorithm": "opening_level_reaction_v1",
     "measurement_schema": "top_of_book_measurements_v3",
     "opening_measurement": "first_60s_ofi_v1",
+    "opening_linking_features": "first_60s_linking_vector_v1",
     "opening_ofi_abs_threshold": 0.005,
     "opening_outcome_seconds": 120,
     "specification": "docs/OPENING_ACCEPTED_BREAK_SHADOW_FORWARD_SPEC_20260819.md",
@@ -776,9 +777,57 @@ def _opening_60s_measurement(day: date, seconds: list[SecondState]) -> dict:
         )
     )
     ofi_score = raw_ofi / activity if activity > 0 else 0.0
+    trade_volume = sum(
+        float(item.buy_volume or 0.0) + float(item.sell_volume or 0.0)
+        for item in opening
+    )
+    flow_score = (
+        sum(float(item.buy_volume or 0.0) - float(item.sell_volume or 0.0)
+            for item in opening) / trade_volume
+        if trade_volume > 0 else 0.0
+    )
+    ofi_side = 1 if ofi_score > 0 else -1 if ofi_score < 0 else None
+    ofi_persistence = (
+        sum(
+            1
+            for item in opening
+            if ofi_side is not None and float(item.ofi or 0.0) * ofi_side > 0
+        )
+        / len(opening)
+        if ofi_side is not None else 0.0
+    )
+    queue_values = [
+        float(item.mean_queue_imbalance)
+        for item in opening
+        if item.mean_queue_imbalance is not None
+    ]
+    micro_values = [
+        float(item.mean_microprice_displacement)
+        for item in opening
+        if item.mean_microprice_displacement is not None
+    ]
+    spread_values = [
+        float(item.mean_spread) for item in opening if item.mean_spread is not None
+    ]
+    depth_values = [
+        float(item.mean_depth) for item in opening if item.mean_depth is not None
+    ]
+    queue_mean = sum(queue_values) / len(queue_values) if queue_values else None
+    micro_mean = sum(micro_values) / len(micro_values) if micro_values else None
+    flow_side = 1 if flow_score > 0 else -1 if flow_score < 0 else None
+    queue_side = 1 if queue_mean is not None and queue_mean > 0 else (
+        -1 if queue_mean is not None and queue_mean < 0 else None
+    )
+    micro_side = 1 if micro_mean is not None and micro_mean > 0 else (
+        -1 if micro_mean is not None and micro_mean < 0 else None
+    )
+    agreement = {
+        "ofi_flow": ofi_side is not None and ofi_side == flow_side,
+        "ofi_queue": ofi_side is not None and ofi_side == queue_side,
+        "ofi_microprice": ofi_side is not None and ofi_side == micro_side,
+    }
     move = float(outcome_window[-1].close_mid - outcome_window[0].open_mid)
     direction = 1 if move > 0 else -1 if move < 0 else 0
-    ofi_side = 1 if ofi_score > 0 else -1 if ofi_score < 0 else None
     threshold_side = (
         ofi_side if abs(ofi_score) >= OPENING_OFI_ABS_THRESHOLD else None
     )
@@ -788,6 +837,27 @@ def _opening_60s_measurement(day: date, seconds: list[SecondState]) -> dict:
         "raw_ofi": raw_ofi,
         "activity_denominator": activity,
         "ofi_score": ofi_score,
+        "linking_features": {
+            "flow_score": flow_score,
+            "ofi_persistence": ofi_persistence,
+            "queue_imbalance_mean": queue_mean,
+            "microprice_displacement_mean": micro_mean,
+            "mean_spread": (
+                sum(spread_values) / len(spread_values) if spread_values else None
+            ),
+            "mean_depth": (
+                sum(depth_values) / len(depth_values) if depth_values else None
+            ),
+            "opening_return_points": (
+                float(opening[-1].close_mid - opening[0].open_mid)
+            ),
+            "opening_range_points": float(
+                max(item.high_mid for item in opening)
+                - min(item.low_mid for item in opening)
+            ),
+            "agreement": agreement,
+            "three_way_flow_queue_micro_agree": all(agreement.values()),
+        },
         "forward_mid_move_points": move,
         "forward_direction": direction,
         "candidates": {
