@@ -92,6 +92,14 @@ The two labels are reported as research candidates only. Their two-minute
 directional results are summarized separately from accepted-break outcomes and
 are not connected to the coordinator, learning, Tier 3, or execution.
 
+The same record carries an unthresholded linking-feature vector for later
+analysis: aggressive trade-flow score, OFI sign persistence, mean queue
+imbalance, mean microprice displacement, mean spread, mean depth, opening
+return, opening range, and agreement flags for OFI with flow, queue, and
+microprice. These fields are descriptive measurements, not additional signals;
+no combination is promoted until it is pre-registered, tested OOS, and shown
+to survive cost and regime-stability checks.
+
 ## Frozen outcome and costs
 
 - Entry: first valid NQ BBO at or after the 30-second decision and no more than
