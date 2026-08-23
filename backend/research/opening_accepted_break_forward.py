@@ -68,7 +68,10 @@ CONTRACT = {
     "symbol": SYMBOL,
     "stype_in": STYPE_IN,
     "algorithm": "opening_level_reaction_v1",
-    "measurement_schema": "top_of_book_measurements_v2",
+    "measurement_schema": "top_of_book_measurements_v3",
+    "opening_measurement": "first_60s_ofi_v1",
+    "opening_ofi_abs_threshold": 0.005,
+    "opening_outcome_seconds": 120,
     "specification": "docs/OPENING_ACCEPTED_BREAK_SHADOW_FORWARD_SPEC_20260819.md",
     "evidence_window_et": ["09:28:00", "09:36:00"],
     "map_lookback_calendar_days": MAP_LOOKBACK_DAYS,
@@ -96,6 +99,7 @@ CONTRACT = {
 CONTRACT_SHA256 = hashlib.sha256(
     json.dumps(CONTRACT, sort_keys=True, separators=(",", ":")).encode()
 ).hexdigest()
+OPENING_OFI_ABS_THRESHOLD = float(CONTRACT["opening_ofi_abs_threshold"])
 
 
 class ForwardRefusal(RuntimeError):
@@ -163,15 +167,29 @@ def validate_collection_time(day: date, now: datetime) -> None:
 class ForwardStore:
     """Append-only attempts plus a restart-safe materialized session result."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), timeout=30)
+        self.read_only = read_only
+        if read_only and self.path.exists():
+            # Check mode must not create journals, acquire write locks, or
+            # mutate the evidence database merely to report its status.
+            self.conn = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=30
+            )
+        else:
+            if read_only:
+                # A first-run check is still useful when no evidence ledger
+                # exists yet; keep that empty result in memory only.
+                self.conn = sqlite3.connect(":memory:", timeout=30)
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.conn = sqlite3.connect(str(self.path), timeout=30)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.executescript(
+        if not read_only or not self.path.exists():
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS accepted_break_forward_sessions (
                 session_date TEXT PRIMARY KEY,
@@ -201,8 +219,8 @@ class ForwardStore:
                 BEFORE DELETE ON accepted_break_forward_events
                 BEGIN SELECT RAISE(ABORT, 'forward event ledger is append-only'); END;
             """
-        )
-        self.conn.commit()
+            )
+            self.conn.commit()
 
     def session(self, day: date | str) -> dict | None:
         row = self.conn.execute(
@@ -287,7 +305,8 @@ class ForwardStore:
 
     def summary(self) -> dict:
         rows = self.conn.execute(
-            """SELECT status, payload_json FROM accepted_break_forward_sessions
+            """SELECT status, contract_sha256, payload_json
+               FROM accepted_break_forward_sessions
                ORDER BY session_date"""
         ).fetchall()
         counts: dict[str, int] = {}
@@ -296,16 +315,41 @@ class ForwardStore:
         complete_sessions = 0
         no_attempt_sessions = 0
         attempts_without_candidate = 0
+        legacy_contract_sessions = 0
+        opening_complete_sessions = 0
+        opening_missing_sessions = 0
+        opening_candidates: dict[str, dict] = {}
         calendar: dict[str, dict] = {}
         by_level_family: dict[str, list[float]] = {}
         by_side: dict[str, list[float]] = {}
         for row in rows:
             status = str(row["status"])
             counts[status] = counts.get(status, 0) + 1
+            if str(row["contract_sha256"]) != CONTRACT_SHA256:
+                legacy_contract_sessions += 1
             if status != "COMPLETE":
                 continue
             complete_sessions += 1
             payload = json.loads(row["payload_json"])
+            opening = payload.get("opening_60s")
+            if opening and opening.get("status") == "COMPLETE":
+                opening_complete_sessions += 1
+                move = opening.get("forward_mid_move_points")
+                for name, candidate in opening.get("candidates", {}).items():
+                    item = opening_candidates.setdefault(
+                        name, {"signals": 0, "wins": 0, "signed_points": []}
+                    )
+                    side = candidate.get("side")
+                    if not candidate.get("eligible") or side not in (-1, 1):
+                        continue
+                    if move is None:
+                        continue
+                    signed = float(side) * float(move)
+                    item["signals"] += 1
+                    item["wins"] += int(signed > 0)
+                    item["signed_points"].append(signed)
+            elif opening:
+                opening_missing_sessions += 1
             attempts = payload.get("attempts", [])
             if not attempts:
                 no_attempt_sessions += 1
@@ -355,10 +399,31 @@ class ForwardStore:
                 **item,
                 "mean_primary_net_points": mean(values) if values else None,
             }
+        opening_summary = {
+            "complete_sessions": opening_complete_sessions,
+            "missing_sessions": opening_missing_sessions,
+            "candidates": {},
+        }
+        for name, item in sorted(opening_candidates.items()):
+            values = item["signed_points"]
+            signals = item["signals"]
+            opening_summary["candidates"][name] = {
+                "signals": signals,
+                "wins": item["wins"],
+                "accuracy": item["wins"] / signals if signals else None,
+                "mean_signed_points": mean(values) if values else None,
+                "mean_signed_points_after_0_5_cost": (
+                    mean(value - 0.5 for value in values) if values else None
+                ),
+                "mean_signed_points_after_1_0_cost": (
+                    mean(value - 1.0 for value in values) if values else None
+                ),
+            }
         return {
             "contract_sha256": CONTRACT_SHA256,
             "first_eligible_session": str(FIRST_ELIGIBLE_SESSION),
             "counts": counts,
+            "legacy_contract_sessions": legacy_contract_sessions,
             "complete_sessions": complete_sessions,
             "no_attempt_sessions": no_attempt_sessions,
             "attempt_sessions_without_accepted_candidate": attempts_without_candidate,
@@ -375,6 +440,7 @@ class ForwardStore:
             "calendar_months": calendar_summary,
             "accepted_by_level_family": grouped(by_level_family),
             "accepted_by_break_side": grouped(by_side),
+            "opening_60s": opening_summary,
             "initial_review_minimum_complete_sessions": 60,
             "stronger_review_minimum_complete_sessions": 120,
             "review_status": (
@@ -654,6 +720,90 @@ def _base_payload(day: date, status: str) -> dict:
     }
 
 
+def _opening_60s_measurement(day: date, seconds: list[SecondState]) -> dict:
+    """Measure frozen first-60-second OFI candidates without execution."""
+    open_ns = _ns(day, time(9, 30))
+    decision_end_ns = open_ns + 60 * 1_000_000_000
+    outcome_end_ns = open_ns + 120 * 1_000_000_000
+    opening = [
+        item for item in seconds
+        if open_ns <= item.bucket_ns < decision_end_ns
+    ]
+    outcome_window = [
+        item for item in seconds
+        if open_ns <= item.bucket_ns < outcome_end_ns
+    ]
+    expected_opening = {
+        open_ns + offset * 1_000_000_000 for offset in range(60)
+    }
+    expected_outcome = {
+        open_ns + offset * 1_000_000_000 for offset in range(120)
+    }
+    base = {
+        "window_et": ["09:30:00", "09:31:00"],
+        "outcome_window_et": ["09:30:00", "09:32:00"],
+        "seconds_observed": len(opening),
+        "outcome_seconds_observed": len(outcome_window),
+        "ofi_score": None,
+        "forward_mid_move_points": None,
+        "forward_direction": None,
+        "candidates": {
+            "ofi_direction_all": {"eligible": False, "side": None},
+            "ofi_direction_abs_ge_0.005": {
+                "eligible": False,
+                "side": None,
+                "threshold": OPENING_OFI_ABS_THRESHOLD,
+            },
+        },
+    }
+    if (
+        len(opening) != 60
+        or {item.bucket_ns for item in opening} != expected_opening
+        or len(outcome_window) != 120
+        or {item.bucket_ns for item in outcome_window} != expected_outcome
+    ):
+        return {"status": "MISSING_OPENING_60S_EVIDENCE", **base}
+
+    raw_ofi = sum(float(item.ofi or 0.0) for item in opening)
+    activity = sum(
+        float(value or 0.0)
+        for item in opening
+        for value in (
+            item.bid_queue_add,
+            item.bid_queue_remove,
+            item.ask_queue_add,
+            item.ask_queue_remove,
+        )
+    )
+    ofi_score = raw_ofi / activity if activity > 0 else 0.0
+    move = float(outcome_window[-1].close_mid - outcome_window[0].open_mid)
+    direction = 1 if move > 0 else -1 if move < 0 else 0
+    ofi_side = 1 if ofi_score > 0 else -1 if ofi_score < 0 else None
+    threshold_side = (
+        ofi_side if abs(ofi_score) >= OPENING_OFI_ABS_THRESHOLD else None
+    )
+    return {
+        "status": "COMPLETE",
+        **base,
+        "raw_ofi": raw_ofi,
+        "activity_denominator": activity,
+        "ofi_score": ofi_score,
+        "forward_mid_move_points": move,
+        "forward_direction": direction,
+        "candidates": {
+            "ofi_direction_all": {
+                "eligible": ofi_side is not None,
+                "side": ofi_side,
+            },
+            "ofi_direction_abs_ge_0.005": {
+                "eligible": threshold_side is not None,
+                "side": threshold_side,
+                "threshold": OPENING_OFI_ABS_THRESHOLD,
+            },
+        },
+    }
+
+
 def evaluate_bundle(day: date, bundle: SourceBundle) -> dict:
     maps, map_quality = build_session_maps_from_bars(bundle.bars)
     session_map = maps.get(day)
@@ -672,6 +822,7 @@ def evaluate_bundle(day: date, bundle: SourceBundle) -> dict:
         raise ForwardRefusal("MBP evidence does not match the cash-open instrument")
     if not quotes:
         raise ForwardRefusal("BBO evidence is unavailable")
+    opening_60s = _opening_60s_measurement(day, seconds)
     open_ns = _ns(day, time(9, 30))
     levels = _cluster_levels([
         *session_map.levels,
@@ -733,6 +884,7 @@ def evaluate_bundle(day: date, bundle: SourceBundle) -> dict:
         ),
         "no_attempt_session": not attempts,
         "overlap_rule_defined": False,
+        "opening_60s": opening_60s,
     })
     return payload
 
@@ -809,7 +961,7 @@ def main() -> int:
     parser.add_argument("--session-date", type=date.fromisoformat)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    store = ForwardStore(args.db)
+    store = ForwardStore(args.db, read_only=args.check)
     if args.check:
         print(json.dumps({
             "status": "READY_NO_NETWORK",

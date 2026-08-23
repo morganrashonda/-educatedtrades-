@@ -8,11 +8,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/shaym/Downloads/Educated_Trades-main 5/scripts/run_opening_accepted_break_forward.sh</string>
+    <string>/Users/shaym/Documents/Educated Trades/main5-opening-causal/scripts/run_opening_accepted_break_forward.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/shaym/Downloads/Educated_Trades-main 5</string>
+  <string>/Users/shaym/Documents/Educated Trades/main5-opening-causal</string>
 
   <!-- launchd uses the Mac's America/Chicago timezone. 15:35 CT is 16:35 ET.
        The observer independently enforces its frozen 16:20 ET lower bound and

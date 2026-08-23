@@ -156,6 +156,38 @@ def test_no_attempt_session_and_level_inventory_are_retained() -> None:
     assert all(item["attempts"] == 0 for item in result["level_inventory"])
 
 
+def test_opening_60s_ofi_candidates_are_measurement_only() -> None:
+    bundle = source_bundle("none")
+    seconds = [state(-1, 99.0)] + [
+        state(value, 100.0 if value < 60 else 100.25)
+        for value in range(120)
+    ]
+    result = forward.evaluate_bundle(DAY, replace(bundle, seconds=tuple(seconds)))
+    opening = result["opening_60s"]
+    assert opening["status"] == "COMPLETE"
+    assert opening["seconds_observed"] == 60
+    assert opening["outcome_seconds_observed"] == 120
+    assert opening["ofi_score"] == pytest.approx(0.8)
+    assert opening["forward_mid_move_points"] == pytest.approx(0.25)
+    assert opening["forward_direction"] == 1
+    assert opening["candidates"]["ofi_direction_all"] == {
+        "eligible": True,
+        "side": 1,
+    }
+    threshold = opening["candidates"]["ofi_direction_abs_ge_0.005"]
+    assert threshold["eligible"] is True
+    assert threshold["side"] == 1
+    assert result["accepted_candidates"] == 0
+
+
+def test_opening_60s_missing_evidence_abstains() -> None:
+    result = forward.evaluate_bundle(DAY, source_bundle("none"))
+    opening = result["opening_60s"]
+    assert opening["status"] == "MISSING_OPENING_60S_EVIDENCE"
+    assert opening["candidates"]["ofi_direction_all"]["eligible"] is False
+    assert result["accepted_candidates"] == 0
+
+
 def test_missing_outcome_quote_never_becomes_candidate() -> None:
     bundle = source_bundle("accepted")
     bundle = replace(bundle, quotes=bundle.quotes[:1])
@@ -194,6 +226,27 @@ def test_refusal_can_retry_but_complete_session_is_immutable(tmp_path) -> None:
     conflicting["map_context"]["cash_open"] = 999.0
     with pytest.raises(forward.ForwardRefusal, match="immutable"):
         store.record(conflicting, datetime.now(timezone.utc))
+
+
+def test_read_only_store_never_requires_write_access(tmp_path) -> None:
+    path = tmp_path / "forward.sqlite"
+    writer = forward.ForwardStore(path)
+    complete = forward.evaluate_bundle(DAY, source_bundle("accepted"))
+    assert writer.record(complete, datetime.now(timezone.utc)) is True
+    writer.conn.close()
+
+    reader = forward.ForwardStore(path, read_only=True)
+    assert reader.summary()["complete_sessions"] == 1
+    with pytest.raises(sqlite3.OperationalError):
+        reader.conn.execute(
+            "INSERT INTO accepted_break_forward_sessions VALUES "
+            "('2099-01-01','x','COMPLETE',0,0,'{}','x','x','x',1)"
+        )
+
+
+def test_read_only_check_works_before_a_database_exists(tmp_path) -> None:
+    reader = forward.ForwardStore(tmp_path / "not-created.sqlite", read_only=True)
+    assert reader.summary()["complete_sessions"] == 0
 
 
 def test_event_ledger_rejects_update_and_delete(tmp_path) -> None:
