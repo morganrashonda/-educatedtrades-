@@ -788,7 +788,11 @@ def _opening_60s_measurement(day: date, seconds: list[SecondState]) -> dict:
     )
     ofi_side = 1 if ofi_score > 0 else -1 if ofi_score < 0 else None
     ofi_persistence = (
-        sum(1 for item in opening if ofi_side is not None and item.ofi * ofi_side > 0)
+        sum(
+            1
+            for item in opening
+            if ofi_side is not None and float(item.ofi or 0.0) * ofi_side > 0
+        )
         / len(opening)
         if ofi_side is not None else 0.0
     )
