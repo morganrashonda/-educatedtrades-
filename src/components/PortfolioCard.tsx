@@ -1,7 +1,15 @@
 import type { Portfolio } from "../types";
 import { TrendingUp, TrendingDown, DollarSign, Target, Wallet, Gauge } from "lucide-react";
 
-export function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
+export function PortfolioCard({
+  portfolio,
+  mode,
+  isHealthy,
+}: {
+  portfolio: Portfolio;
+  mode: "manual" | "autonomous";
+  isHealthy: boolean;
+}) {
   const isPnlPositive = portfolio.pnlDay >= 0;
 
   return (
@@ -61,17 +69,25 @@ export function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
       <div className="stat-card">
         <div className="flex items-center justify-between mb-3">
           <span className="metric-label">Status</span>
-          <div className="w-8 h-8 rounded-lg bg-green-bright/10 flex items-center justify-center">
-            <Gauge className="w-4 h-4 text-green-bright" />
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+            isHealthy ? 'bg-green-bright/10' : 'bg-red-bright/10'
+          }`}>
+            <Gauge className={`w-4 h-4 ${isHealthy ? 'text-green-bright' : 'text-red-bright'}`} />
           </div>
         </div>
         <div className="flex items-center gap-2.5 mt-1">
-          <span className="w-2.5 h-2.5 rounded-full bg-green-bright animate-pulse shadow-lg shadow-green-bright/30" />
-          <span className="font-semibold text-green-bright text-sm">Live Trading</span>
+          <span className={`w-2.5 h-2.5 rounded-full ${
+            isHealthy ? 'bg-green-bright animate-pulse shadow-lg shadow-green-bright/30' : 'bg-red-bright'
+          }`} />
+          <span className={`font-semibold text-sm ${isHealthy ? 'text-green-bright' : 'text-red-bright'}`}>
+            {isHealthy ? 'Live Trading' : 'Trading Halted'}
+          </span>
         </div>
         <div className="flex items-center gap-1.5 mt-2">
           <div className="rounded-full bg-accent-500/10 px-2.5 py-0.5">
-            <span className="text-[10px] font-bold text-accent-400 uppercase tracking-wider">Sniper Mode</span>
+            <span className="text-[10px] font-bold text-accent-400 uppercase tracking-wider">
+              {mode === 'autonomous' ? 'Sniper Mode' : 'Manual Mode'}
+            </span>
           </div>
         </div>
       </div>

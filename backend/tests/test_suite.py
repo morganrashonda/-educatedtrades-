@@ -2335,12 +2335,14 @@ chk("O10 status reports the error streak", "consecutive_errors" in _status)
 chk("O11 status reports cycle count", _status["cycle_count"] == 8,
     _status["cycle_count"], 8)
 
-# A big sentiment swing is flagged.
+# Sentiment no longer drives trading, so it must not raise trading-flavored
+# alerts either -- a swing or strong reading here would misleadingly look
+# like it described a decision it can no longer influence.
 _m5 = _alerts()
-_res = _m5.check_cycle(0.7, "bullish", [], 10, prev_conviction=0.1)
-chk("O12 a large sentiment swing raises an alert",
-    any(a["type"] == "big_move" for a in _res["alerts"]),
-    [a["type"] for a in _res["alerts"]], "big_move")
+_res = _m5.check_cycle(0.7, "bullish", [], 10)
+chk("O12 sentiment swings no longer raise big_move/strong_signal alerts",
+    not any(a["type"] in ("big_move", "strong_signal") for a in _res["alerts"]),
+    [a["type"] for a in _res["alerts"]], "no big_move/strong_signal")
 
 # A database failure must not break the pipeline.
 # Fail at the real seam (the DB insert), not at the wrapper that guards it.
@@ -2355,6 +2357,145 @@ except Exception:
 finally:
     _mon.insert_alert = _orig_insert
 chk("O13 alerting survives a database failure", _survived)
+
+
+# --- TA. Tier-2 threshold advisory is recommendation-only ------------------
+# _generate_tier2_threshold_advisory() writes suggested RSI-threshold nudges
+# to tuned_thresholds.json for a human to review. It must never be able to
+# move the live thresholds the pipeline actually trades on -- applying a
+# recommendation is a separate, deliberate operator action.
+chk("TA-1 the live RSI thresholds are hardcoded constants",
+    (patterns.RSI_OVERSOLD, patterns.RSI_OVERBOUGHT) == (30, 70),
+    (patterns.RSI_OVERSOLD, patterns.RSI_OVERBOUGHT), (30, 70))
+
+_ta_dir = tempfile.mkdtemp()
+_main.DATA_DIR = _ta_dir
+_ta_eng = PatternEngine(db_path=Path(_ta_dir) / "patterns.db")
+_ta_conn = _ta_eng.db._connect()
+for _i in range(10):
+    _ta_conn.execute(
+        "INSERT INTO pattern_memory "
+        "(timestamp, symbol, pattern_hash, sentiment_zone, rsi_zone, ema_cross, "
+        " rsi_value, outcome, tier) "
+        "VALUES (?, 'SPY', 'h', 'neutral', 'oversold', 'bullish', 28.0, ?, 'exploration')",
+        (time.time(), "win" if _i < 8 else "loss"),
+    )
+_ta_conn.commit()
+
+_ta_thresholds_path = Path(_ta_dir) / "tuned_thresholds.json"
+_ta_thresholds_path.write_text("{}")
+
+_ta_orch = _main.Orchestrator.__new__(_main.Orchestrator)
+_ta_orch.state = _main.PipelineState()
+_ta_orch.state.tier_2_total_trades = 100
+_ta_orch.state.tier_2_eval_cycle = 0
+_ta_orch._pattern_engine = _ta_eng
+_ta_orch._generate_tier2_threshold_advisory()
+
+_ta_written = _json.loads(_ta_thresholds_path.read_text())
+chk("TA-2 the advisory tags its output recommendation-only",
+    _ta_written.get("recommendation_only") is True,
+    _ta_written.get("recommendation_only"), True)
+chk("TA-3 the advisory records a sample size and data window",
+    _ta_written.get("sample_size") == 10 and _ta_written.get("data_window") is not None,
+    (_ta_written.get("sample_size"), _ta_written.get("data_window")), (10, "<window dict>"))
+chk("TA-4 the advisory records the live config it was generated against",
+    isinstance(_ta_written.get("config_hash"), str) and len(_ta_written["config_hash"]) > 0,
+    _ta_written.get("config_hash"), "<non-empty hash>")
+chk("TA-5 running the advisory never changes the live RSI constants",
+    (patterns.RSI_OVERSOLD, patterns.RSI_OVERBOUGHT) == (30, 70),
+    (patterns.RSI_OVERSOLD, patterns.RSI_OVERBOUGHT), (30, 70))
+
+
+# --- TG. Tier 2 exploration: grey-zone boundary and safety gate -----------
+chk("TG-1 just below the Tier-1 oversold gate is not a grey-zone entry",
+    _main.tier2_grey_zone_side(30.0) is None, _main.tier2_grey_zone_side(30.0), None)
+chk("TG-2 just above the Tier-1 oversold gate is a buy grey-zone entry",
+    _main.tier2_grey_zone_side(30.5) == "buy", _main.tier2_grey_zone_side(30.5), "buy")
+chk("TG-3 the Tier-2 oversold boundary itself is still in the grey zone",
+    _main.tier2_grey_zone_side(35.0) == "buy", _main.tier2_grey_zone_side(35.0), "buy")
+chk("TG-4 past the Tier-2 oversold boundary is not a grey-zone entry",
+    _main.tier2_grey_zone_side(35.5) is None, _main.tier2_grey_zone_side(35.5), None)
+chk("TG-5 the Tier-2 overbought boundary is a sell grey-zone entry",
+    _main.tier2_grey_zone_side(65.0) == "sell", _main.tier2_grey_zone_side(65.0), "sell")
+chk("TG-6 just below the Tier-2 overbought boundary is not a grey-zone entry",
+    _main.tier2_grey_zone_side(64.5) is None, _main.tier2_grey_zone_side(64.5), None)
+chk("TG-7 just below the Tier-1 overbought gate is a sell grey-zone entry",
+    _main.tier2_grey_zone_side(69.5) == "sell", _main.tier2_grey_zone_side(69.5), "sell")
+chk("TG-8 the Tier-1 overbought gate itself is not a grey-zone entry",
+    _main.tier2_grey_zone_side(70.0) is None, _main.tier2_grey_zone_side(70.0), None)
+chk("TG-9 mid-range RSI is never a grey-zone entry",
+    _main.tier2_grey_zone_side(50.0) is None, _main.tier2_grey_zone_side(50.0), None)
+
+
+def _tier2_orch(*, autonomous=True, market_open=True,
+                 tier_2_trades_today=0, broker_environment="paper",
+                 broker_simulating=False):
+    o = _main.Orchestrator.__new__(_main.Orchestrator)
+    o.state = _main.PipelineState()
+    o.state.mode = (_main.OrchestratorMode.AUTONOMOUS if autonomous
+                     else _main.OrchestratorMode.MANUAL)
+    o.state.tier_2_trades_today = tier_2_trades_today
+    o._market_clock = SimpleNamespace(is_open=lambda: True)
+    o._trading_engine = SimpleNamespace(
+        broker=SimpleNamespace(is_simulating=broker_simulating,
+                                environment=broker_environment))
+    return o
+
+
+_tg = _tier2_orch()
+chk("TG-10 a fully-satisfied gate authorizes",
+    _tg._tier2_exploration_gate(True) == (True, "authorized"),
+    _tg._tier2_exploration_gate(True), (True, "authorized"))
+
+chk("TG-11 manual mode refuses",
+    _tier2_orch(autonomous=False)._tier2_exploration_gate(True)[0] is False)
+
+chk("TG-12 a closed market refuses",
+    _tier2_orch()._tier2_exploration_gate(False)[0] is False)
+
+chk("TG-13 the daily cap refuses once reached",
+    _tier2_orch(tier_2_trades_today=_main.TIER_2_DAILY_CAP)
+        ._tier2_exploration_gate(True)[0] is False)
+
+chk("TG-14 a simulating broker refuses -- Tier 2 never places a live order",
+    _tier2_orch(broker_simulating=True)._tier2_exploration_gate(True)[0] is False)
+
+chk("TG-15 a non-paper environment refuses even when not simulating",
+    _tier2_orch(broker_environment="live")._tier2_exploration_gate(True)[0] is False)
+
+
+# The oversold/overbought labeling fix: an overbought grey-zone bucket must
+# be named tier_*_rsi_overbought, not tier_*_rsi_oversold (the original
+# version of this method named every bucket "oversold" regardless of side).
+_tgl_dir = tempfile.mkdtemp()
+_main.DATA_DIR = _tgl_dir
+_tgl_eng = PatternEngine(db_path=Path(_tgl_dir) / "patterns.db")
+_tgl_conn = _tgl_eng.db._connect()
+for _i in range(10):
+    _tgl_conn.execute(
+        "INSERT INTO pattern_memory "
+        "(timestamp, symbol, pattern_hash, sentiment_zone, rsi_zone, ema_cross, "
+        " rsi_value, outcome, tier) "
+        "VALUES (?, 'SPY', 'h', 'neutral', 'overbought', 'bearish', 67.0, ?, 'exploration')",
+        (time.time(), "win" if _i < 8 else "loss"),
+    )
+_tgl_conn.commit()
+_tgl_thresholds_path = Path(_tgl_dir) / "tuned_thresholds.json"
+_tgl_thresholds_path.write_text("{}")
+
+_tgl_orch = _main.Orchestrator.__new__(_main.Orchestrator)
+_tgl_orch.state = _main.PipelineState()
+_tgl_orch.state.tier_2_total_trades = 100
+_tgl_orch.state.tier_2_eval_cycle = 0
+_tgl_orch._pattern_engine = _tgl_eng
+_tgl_orch._generate_tier2_threshold_advisory()
+
+_tgl_written = _json.loads(_tgl_thresholds_path.read_text())
+_tgl_params = [k for k in _tgl_written if k.startswith("tier_")]
+chk("TG-16 an overbought bucket is named with 'overbought', not 'oversold'",
+    len(_tgl_params) == 1 and "overbought" in _tgl_params[0],
+    _tgl_params, "<one tier_*_rsi_overbought param>")
 
 
 # --- E3. Multiple-testing correction --------------------------------------

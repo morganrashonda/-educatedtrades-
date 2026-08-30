@@ -502,13 +502,16 @@ def run_backtest(data: Dict[str, List[Bar]], test_start: date, test_end: date,
             peak_equity = max(peak_equity, equity_now)
             drawdown = (equity_now - peak_equity) / peak_equity if peak_equity > 0 else 0.0
 
-            # Drawdown Safety Floors
-            if drawdown <= -0.15:
+            # Drawdown Safety Floors — mirrors the live orchestrator's policy
+            # (backend/main.py._finalize_cycle) via the shared constants in
+            # patterns.py, so the backtest can't silently drift from what the
+            # live bot actually does.
+            if drawdown <= -P.DRAWDOWN_KILL_PCT:
                 # stop all trading
                 continue
 
-            # Halve position size if drawdown is -8% or worse
-            risk_mult = 0.5 if drawdown <= -0.08 else 1.0
+            # Halve position size once drawdown crosses the live halving floor
+            risk_mult = 0.5 if drawdown <= -P.DRAWDOWN_HALVE_PCT else 1.0
             
             # Portfolio cap assertion
             PORTFOLIO_CAP = 0.15

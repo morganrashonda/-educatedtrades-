@@ -270,13 +270,6 @@ class TradeSignal:
           - If they disagree: weighted by pattern confidence
           - Default: use sentiment, modulated by pattern if available
         """
-        import sys
-        sys.path.insert(0, "/home/team/shared/backend")
-        try:
-            from patterns import EvaluationSignal as ES
-        except ImportError:
-            ES = None
-
         if pattern_signal is not None:
             pattern_conv = pattern_signal.conviction
             pattern_action = pattern_signal.action

@@ -137,10 +137,17 @@ class AlertManager:
         consensus: str,
         errors: List[str],
         cycle_count: int,
-        prev_conviction: Optional[float] = None,
     ) -> dict:
         """
         Run all alert checks for a pipeline cycle.
+
+        Sentiment swing and strong-conviction alerts were removed here:
+        sentiment was pulled out of the trading signal path (main.py's
+        pipeline builds direction/strength from price alone), so alerting on
+        it read as if it described trading decisions it no longer influences.
+        `sentiment_conviction` is kept as an argument only because the stale-
+        market check below still uses it, and `_last_sentiment` remains
+        available via `status()` as informational telemetry.
 
         Returns:
             Dict with triggered alerts summary.
@@ -148,38 +155,7 @@ class AlertManager:
         self._cycle_count = cycle_count
         triggered: List[dict] = []
 
-        # 1. Big Move: Sentiment swing > 0.4
-        if prev_conviction is not None:
-            swing = abs(sentiment_conviction - prev_conviction)
-            if swing > 0.4:
-                alert = self._create_alert(
-                    alert_type="big_move",
-                    severity=SEVERITY_WARNING,
-                    message=(
-                        f"Large sentiment swing detected: "
-                        f"{prev_conviction:+.3f} → {sentiment_conviction:+.3f} "
-                        f"(Δ={swing:.3f}, consensus={consensus}) "
-                        f"in cycle #{cycle_count}"
-                    ),
-                )
-                if alert:
-                    triggered.append(alert)
-
-        # 2. Strong conviction alert
-        if abs(sentiment_conviction) > 0.6:
-            direction = "BULLISH" if sentiment_conviction > 0 else "BEARISH"
-            alert = self._create_alert(
-                alert_type="strong_signal",
-                severity=SEVERITY_INFO,
-                message=(
-                    f"Strong {direction} conviction: "
-                    f"{sentiment_conviction:+.3f} (cycle #{cycle_count})"
-                ),
-            )
-            if alert:
-                triggered.append(alert)
-
-        # 3. System Break: Consecutive errors
+        # System Break: Consecutive errors
         if errors:
             # Count error CYCLES, not error instances. Adding len(errors) and
             # decrementing by one on a clean cycle made this a leaky
@@ -202,7 +178,7 @@ class AlertManager:
             # A clean cycle breaks the streak. That is what consecutive means.
             self._consecutive_errors = 0
 
-        # 4. Prolonged neutral sentiment (stale market)
+        # Prolonged neutral sentiment (stale market)
         if abs(sentiment_conviction) < 0.05 and cycle_count > 5:
             alert = self._create_alert(
                 alert_type="stale_market",
