@@ -8,6 +8,8 @@
 
 numpy==1.26.4           # patterns.py — indicator maths
 alpaca-py==0.43.0       # trading.py, main.py — broker client
+pandas==2.3.3           # alpaca-py compatibility — pandas 3 drops pytz
+pytz==2026.3.post1      # alpaca.data imports this directly during backfill
 requests==2.32.3        # news_ingestion.py — Finnhub REST calls
 vaderSentiment==3.3.2   # sentiment.py — retained for news telemetry only;
                         # sentiment no longer contributes to the signal path
