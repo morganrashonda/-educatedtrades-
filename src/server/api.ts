@@ -134,7 +134,9 @@ export async function getOvernightRisk() {
     if (!response.ok) throw new Error('API request failed');
     return await response.json();
   } catch (error) {
-    // Endpoint not available yet — return null gracefully
+    // The UI treats null as "not available yet," but a broken endpoint should
+    // still be visible in server logs rather than looking identical to that.
+    console.error('Error fetching overnight risk:', error);
     return null;
   }
 }

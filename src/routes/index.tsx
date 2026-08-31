@@ -482,7 +482,9 @@ function Dashboard() {
 
           {/* Stats Summary Row */}
           <div className="animate-slide-up-delay-1">
-            {isLoading ? <SkeletonCard rows={2} /> : <PortfolioCard portfolio={data.portfolio} />}
+            {isLoading ? <SkeletonCard rows={2} /> : (
+              <PortfolioCard portfolio={data.portfolio} mode={data.systemHealth.mode} isHealthy={isHealthy} />
+            )}
           </div>
 
           {/* Risk & Safety Section */}

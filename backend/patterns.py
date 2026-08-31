@@ -1041,6 +1041,13 @@ def mean_reversion_conviction(rsi: Optional[float]) -> float:
 ADX_TREND_MIN = 25.0     # ADX > 25 → trending
 ADX_RANGE_MAX = 20.0     # ADX < 20 → range-bound; 20-25 → transitioning
 
+# Portfolio drawdown policy (fraction of peak equity). Shared between the live
+# orchestrator (main.py) and the backtester (backtest.py) so the backtest
+# keeps modeling the same risk policy the live bot actually runs, instead of
+# the two drifting apart silently.
+DRAWDOWN_KILL_PCT = 0.15   # drawdown >= 15% from peak -> kill switch engages
+DRAWDOWN_HALVE_PCT = 0.06  # drawdown >= 6% from peak -> position sizes halved
+
 
 def compute_adx(
     highs: List[float], lows: List[float], closes: List[float],
