@@ -68,6 +68,38 @@ session context without affecting the candidate classification.
 The frozen predicted direction for an accepted break is continuation. Failed
 break reversal is not a candidate in this run.
 
+## Separate first-60-second OFI measurement
+
+Each complete session also records a separate, measurement-only opening
+measurement. It does not alter accepted-break classification, create an
+accepted-break event, or authorize an order.
+
+- Measurement window: exactly 09:30:00-09:30:59 ET, requiring all 60 one-second
+  MBP states.
+- Signal: normalized OFI equals the sum of the one-second OFI values divided by
+  the sum of bid/ask queue additions and removals over that window.
+- Outcome: the mid-price change from the first opening state through the last
+  state in the first 120 seconds after 09:30 ET.
+- Candidate A, `ofi_direction_all`: long when the normalized OFI is positive,
+  short when negative, and abstain at zero.
+- Candidate B, `ofi_direction_abs_ge_0.005`: the same direction rule, but
+  abstain unless the absolute normalized OFI is at least 0.005. This threshold
+  is frozen before forward collection and is not tuned per session.
+- Missing any required opening or outcome second records
+  `MISSING_OPENING_60S_EVIDENCE`; it is never imputed.
+
+The two labels are reported as research candidates only. Their two-minute
+directional results are summarized separately from accepted-break outcomes and
+are not connected to the coordinator, learning, Tier 3, or execution.
+
+The same record carries an unthresholded linking-feature vector for later
+analysis: aggressive trade-flow score, OFI sign persistence, mean queue
+imbalance, mean microprice displacement, mean spread, mean depth, opening
+return, opening range, and agreement flags for OFI with flow, queue, and
+microprice. These fields are descriptive measurements, not additional signals;
+no combination is promoted until it is pre-registered, tested OOS, and shown
+to survive cost and regime-stability checks.
+
 ## Frozen outcome and costs
 
 - Entry: first valid NQ BBO at or after the 30-second decision and no more than

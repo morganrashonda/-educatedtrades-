@@ -4,16 +4,14 @@ set -euo pipefail
 umask 077
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
-export PYTHONPYCACHEPREFIX="/private/tmp/main5-accepted-break-forward-pycache"
+export PYTHONPYCACHEPREFIX="/private/tmp/main5-preopen-conditional-pycache"
 
-# Resolve the repository from this wrapper so a copied/reloaded LaunchAgent
-# cannot silently fall back to an obsolete checkout path.
 script_dir="${0:A:h}"
 repo_dir="${script_dir:h}"
 env_file="/Users/shaym/Downloads/Educated_Trades-main 5/.env"
 python_bin="/Users/shaym/Downloads/Educated_Trades-main 5/backend/venv/bin/python"
 observer_data_dir="${OPENING_FORWARD_DATA_DIR:-/Users/shaym/.educated-trades/research}"
-observer_db="${observer_data_dir}/opening_accepted_break_forward.db"
+observer_db="${observer_data_dir}/opening_preopen_conditional_forward.db"
 
 if [[ ! -r "${env_file}" ]]; then
   print -u2 -- "observer refused: missing readable ${env_file}"
@@ -36,12 +34,12 @@ mkdir -p "${observer_data_dir}"
 cd "${repo_dir}"
 
 if [[ "${1:-}" == "--check" ]]; then
-  exec "${python_bin}" -m backend.research.opening_accepted_break_forward \
+  exec "${python_bin}" -m backend.research.opening_preopen_conditional_forward \
     --db "${observer_db}" \
     --check
 fi
 
 session_date="$(TZ=America/New_York date +%F)"
-exec "${python_bin}" -m backend.research.opening_accepted_break_forward \
+exec "${python_bin}" -m backend.research.opening_preopen_conditional_forward \
   --db "${observer_db}" \
   --session-date "${session_date}"
