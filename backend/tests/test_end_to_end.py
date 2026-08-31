@@ -377,4 +377,8 @@ for name, ok, got, exp in RESULTS:
             print("       got: %s" % (got,))
             print("       exp: %s" % (exp,))
 print("\n%d/%d passed, %d failed" % (len(RESULTS) - fails, len(RESULTS), fails))
-sys.exit(1 if fails else 0)
+if __name__ == "__main__":
+    # Guarded so pytest can import/collect this file (it has no test_*
+    # items of its own -- everything above runs as a side effect of
+    # import) without an unguarded SystemExit aborting collection.
+    sys.exit(1 if fails else 0)

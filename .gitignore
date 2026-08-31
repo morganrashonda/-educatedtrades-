@@ -67,3 +67,6 @@ bot.process.lock
 patterns_fits/
 backup_repo/
 notifications/
+
+# Personal Claude Code overrides (permission rules, etc.) -- not shared.
+.claude/settings.local.json

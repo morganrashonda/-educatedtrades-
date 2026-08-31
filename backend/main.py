@@ -273,12 +273,32 @@ TRANSIENT_CYCLE_FAILURE_THRESHOLD = max(1, int(os.environ.get("TRANSIENT_CYCLE_F
 RSI_MEAN_REVERT_OVERSOLD = 30.0
 RSI_MEAN_REVERT_OVERBOUGHT = 70.0
 
-# Tier 2 (Exploration) thresholds
+# Tier 2 (exploration): small PAPER-only mean-reversion trades taken only in
+# the RSI "grey zone" between the live Tier-1 gate above and a looser
+# candidate threshold -- i.e. (RSI_MEAN_REVERT_OVERSOLD, TIER_2_RSI_OVERSOLD]
+# on the oversold side, [TIER_2_RSI_OVERBOUGHT, RSI_MEAN_REVERT_OVERBOUGHT) on
+# the overbought side. These exist only to give
+# _generate_tier2_threshold_advisory() real comparison data on whether
+# loosening the Tier-1 threshold would still perform acceptably; they never
+# change Tier-1 sizing or side selection, and can never place a live order
+# (see _tier2_exploration_gate).
 TIER_2_RSI_OVERSOLD = 35.0
 TIER_2_RSI_OVERBOUGHT = 65.0
-TIER_2_ADX_CEILING = 22.0
-TIER_2_RISK_FACTOR = 0.15
-TIER_2_DAILY_CAP = 3
+TIER_2_RISK_FACTOR = 0.15   # multiplies TIER_1_RISK_PER_TRADE -- deliberately tiny
+TIER_2_DAILY_CAP = 3        # max Tier 2 exploration entries per day, all symbols
+
+
+def tier2_grey_zone_side(rsi_value: float) -> Optional[str]:
+    """Which side of the Tier-2 RSI grey zone rsi_value falls in, if any.
+
+    A pure, standalone check so the boundary math (which the pipeline cycle
+    consults inline) can be tested without constructing a full cycle.
+    """
+    if RSI_MEAN_REVERT_OVERSOLD < rsi_value <= TIER_2_RSI_OVERSOLD:
+        return "buy"
+    if TIER_2_RSI_OVERBOUGHT <= rsi_value < RSI_MEAN_REVERT_OVERBOUGHT:
+        return "sell"
+    return None
 
 # Shadow-forward cold-start repair. Shadow observations never enter
 # pattern_memory and can only qualify a one-share PAPER exploration order.
@@ -2206,6 +2226,38 @@ class Orchestrator:
             blockers.append(safety_reason)
         return not blockers, "; ".join(blockers) if blockers else "authorized", evidence
 
+    def _tier2_exploration_gate(self, market_open: bool) -> tuple:
+        """Authorize a small PAPER-only Tier-2 RSI-threshold exploration trade.
+
+        Unlike _paper_exploration_gate, this does not require pre-existing
+        shadow evidence and is not long-only -- the whole point is to gather
+        fresh, symmetric win/loss data on both the oversold and overbought
+        grey zones for _generate_tier2_threshold_advisory() to compare
+        against the Tier-1 baseline. It can never place a live order.
+        """
+        blockers = []
+        if not self.state.is_autonomous:
+            blockers.append("not autonomous")
+        if not market_open:
+            blockers.append("market closed")
+        if self.state.news_fetch_degraded:
+            blockers.append("news ingestion degraded")
+        if self.state.startup_recovery_blocked:
+            blockers.append("startup recovery incomplete")
+        if self.state.health_failed_this_session:
+            blockers.append("pre-market health failed")
+        if self.state.tier_2_trades_today >= TIER_2_DAILY_CAP:
+            blockers.append("tier 2 exploration daily cap reached")
+
+        broker = self.trading.broker
+        if broker.is_simulating or getattr(broker, "environment", None) != "paper":
+            blockers.append("paper broker required")
+
+        allowed, safety_reason = self.authorize_entry("tier-2 RSI exploration")
+        if not allowed:
+            blockers.append(safety_reason)
+        return not blockers, "; ".join(blockers) if blockers else "authorized"
+
     def _record_filled_pattern(
         self, symbol: str, side: str, conviction: float, rsi_value: float,
         exec_result, signal_dict: dict, strategy: str, regime: str, tier: str,
@@ -3688,6 +3740,15 @@ class Orchestrator:
                         side = "sell"
                         action = "sell" if blended > -self.high_conviction else "strong_sell"
 
+                # Tier 2 exploration candidate: RSI in the grey zone the
+                # Tier-1 gate just missed. Independent of pattern_allowed --
+                # this measures raw threshold sensitivity, not a learned
+                # pattern -- and only ever applies when Tier-1 did not
+                # already claim this symbol this cycle.
+                tier2_side = None
+                if strategy == "mean_reversion" and not mean_reversion_applied:
+                    tier2_side = tier2_grey_zone_side(rsi_value)
+
                 is_high_conviction = abs(blended) >= self.high_conviction
 
                 signal_dict = {
@@ -3841,6 +3902,59 @@ class Orchestrator:
                         signal_dict["paper_exploration_blocked"] = why
                         self._record_refusal("paper exploration evidence not ready", symbol)
 
+                # Tier 2: small PAPER-only trade in the RSI grey zone, purely
+                # to give the threshold advisory real comparison data. Never
+                # runs if Tier-1 already claimed this symbol this cycle.
+                if not signal_dict.get("executed") and tier2_side:
+                    allowed, why = self._tier2_exploration_gate(market_open)
+                    signal_dict["tier2_exploration_allowed"] = allowed
+                    if allowed:
+                        tier2_conviction = _pmod.mean_reversion_conviction(rsi_value)
+                        _orig_risk = self.trading.risk_per_trade
+                        self.trading.risk_per_trade = TIER_1_RISK_PER_TRADE * TIER_2_RISK_FACTOR
+                        try:
+                            tier2_signal = trade_mod.TradeSignal(
+                                symbol=symbol,
+                                action=tier2_side,
+                                conviction=tier2_conviction,
+                                source="tier2-rsi-threshold-exploration",
+                                stop_loss_pct=STOP_LOSS_PCT,
+                                take_profit_pct=TAKE_PROFIT_PCT,
+                                reason=(
+                                    f"Cycle #{cycle_num} tier-2 RSI grey-zone "
+                                    f"exploration (rsi={rsi_value:.1f})"
+                                ),
+                            )
+                            tier2_result = self.trading.execute(
+                                tier2_signal, overnight_risk=self.carries_overnight_risk())
+                        finally:
+                            self.trading.risk_per_trade = _orig_risk
+                        signal_dict["tier2_exploration_side"] = tier2_side
+                        signal_dict["executed_tier2_exploration"] = tier2_result.success
+                        if tier2_result.success:
+                            signal_dict["executed"] = True
+                            signal_dict["tier"] = "exploration"
+                        signal_dict["tier2_exploration_order_id"] = tier2_result.order_id
+                        signal_dict["tier2_exploration_status"] = tier2_result.status.value
+                        if tier2_result.success and tier2_result.filled_price:
+                            self.state.tier_2_trades_today += 1
+                            self.state.tier_2_total_trades += 1
+                            try:
+                                self._record_filled_pattern(
+                                    symbol, tier2_side, tier2_conviction, rsi_value,
+                                    tier2_result, signal_dict, strategy, regime,
+                                    "exploration")
+                            except Exception as record_exc:
+                                logger.error(
+                                    "TIER 2 EXPLORATION [%s] filled but pattern "
+                                    "tracking failed: %s", symbol, record_exc)
+                            logger.warning(
+                                "TIER 2 EXPLORATION [%s]: %s in RSI grey zone (rsi=%.1f)",
+                                symbol, tier2_side.upper(), rsi_value)
+                    else:
+                        signal_dict["tier2_exploration_blocked"] = why
+                        self._record_refusal("tier 2 exploration not authorized", symbol)
+
                 result.setdefault("trade_signals", []).append(signal_dict)
 
         except Exception as e:
@@ -3874,12 +3988,34 @@ class Orchestrator:
         return result
 
 
-    def _evaluate_tier2_learning(self) -> None:
-        """Evaluate Tier 2 exploration trades and adjust thresholds."""
+    def _generate_tier2_threshold_advisory(self) -> None:
+        """Generate a Tier-2 RSI threshold *recommendation* report.
+
+        This is advisory only. It compares paper-exploration ('tier=exploration')
+        outcomes against the Tier-1 baseline and writes recommended threshold
+        nudges to tuned_thresholds.json, explicitly tagged
+        ``recommendation_only: True``. It never writes to
+        ``patterns.RSI_OVERSOLD`` / ``RSI_OVERBOUGHT`` or any other live
+        trading constant. Applying a recommendation is a separate, deliberate
+        operator action (edit the threshold in patterns.py, validate in paper
+        mode, keep a rollback path) -- consistent with this codebase's rule
+        that only the operator's own action may change persisted trading
+        state, not an automated evaluation loop.
+
+        NOTE: as of this writing nothing calls this method, and nothing tags
+        pattern_memory rows with tier='exploration' or increments
+        ``tier_2_total_trades`` -- the whole Tier-2 concept this advisory
+        reads from is currently dormant. It is left uncalled here rather than
+        wired into the pipeline, since doing that would mean also building
+        the trade-tagging/counting side in the live execution path, which is
+        a separate, larger change.
+        """
         if self.state.tier_2_total_trades < 25 * (self.state.tier_2_eval_cycle + 1):
             return
         try:
             import json
+            import time as _time
+            import hashlib
             from pathlib import Path
             thresholds_path = Path(DATA_DIR) / "tuned_thresholds.json"
             audit_path = Path(DATA_DIR) / "tuning_audit.json"
@@ -3887,16 +4023,27 @@ class Orchestrator:
                 return
             with open(thresholds_path) as f:
                 thresholds = json.load(f)
-            # Query Tier 2 completed trades from pattern_memory
+
+            pmod = _import_patterns()
+
+            # Query Tier 2 (paper-exploration) completed trades from pattern_memory
             try:
                 conn = self.patterns.db._connect()
                 rows = conn.execute(
-                    "SELECT rsi_value, outcome FROM pattern_memory WHERE tier='exploration' AND outcome != 'pending'"
+                    "SELECT rsi_value, outcome, timestamp FROM pattern_memory "
+                    "WHERE tier='exploration' AND outcome != 'pending'"
                 ).fetchall()
             except Exception:
                 rows = []
             if not rows:
                 return
+
+            _timestamps = [r[2] for r in rows if r[2] is not None]
+            data_window = {
+                "start": min(_timestamps) if _timestamps else None,
+                "end": max(_timestamps) if _timestamps else None,
+            }
+
             # Group by RSI bucket (3-point buckets)
             buckets = {}
             for row in rows:
@@ -3918,51 +4065,89 @@ class Orchestrator:
             tier1_wins = sum(1 for r in tier1_rows if r[0] == "win")
             tier1_total = len(tier1_rows)
             tier1_win_rate = tier1_wins / tier1_total if tier1_total > 0 else 0.5
-            # Evaluate each bucket
+
+            # The live config this recommendation was generated against. If
+            # the live thresholds change later, this hash shows a stored
+            # recommendation was computed against a now-superseded baseline.
+            config_hash = hashlib.sha256(
+                (
+                    f"RSI_OVERSOLD={pmod.RSI_OVERSOLD}|"
+                    f"RSI_OVERBOUGHT={pmod.RSI_OVERBOUGHT}|"
+                    f"ADX_TREND_MIN={pmod.ADX_TREND_MIN}|"
+                    f"ADX_RANGE_MAX={pmod.ADX_RANGE_MAX}"
+                ).encode()
+            ).hexdigest()[:16]
+
+            # Evaluate each bucket. Oversold (bucket < 50) and overbought
+            # (bucket >= 50) are mirror images of each other around RSI 50 --
+            # the original version of this method only ever named results
+            # "tier_1_rsi_oversold"/"tier_2_rsi_oversold" regardless of which
+            # side a bucket fell on, which would have mislabeled every
+            # overbought recommendation once real overbought data existed.
+            # Promote/tighten step sizes and bounds are mirrored unchanged
+            # from the oversold side (100 - value), not independently
+            # re-derived -- that directional logic predates any real data and
+            # is reviewed by a human before ever being applied, per the
+            # docstring above.
             audit_entries = []
-            for bucket, stats in sorted(buckets.items()):
+
+            def _evaluate_bucket(bucket: int, stats: dict, oversold: bool) -> None:
                 if stats["total"] < 3:
-                    continue
+                    return
                 wr = stats["wins"] / stats["total"]
+                ci_low, ci_high = pmod.PatternStats._wilson_bounds(stats["wins"], stats["total"])
+                side = "oversold" if oversold else "overbought"
                 if wr >= tier1_win_rate - 0.05:
-                    param = "tier_1_rsi_oversold"
-                    old_val = thresholds.get(param, 30.0)
-                    new_val = max(25.0, old_val - 1.0)
-                    if new_val != old_val and old_val > 25.0:
-                        thresholds[param] = new_val
-                        audit_entries.append({
-                            "timestamp": __import__("time").time(),
-                            "parameter": param,
-                            "old_value": old_val,
-                            "new_value": new_val,
-                            "direction": "promote",
-                            "sample_size": stats["total"],
-                            "tier2_win_rate": round(wr, 4),
-                            "tier1_win_rate": round(tier1_win_rate, 4),
-                            "reason": f"Tier 2 bucket RSI {bucket}-{bucket+3} within 5% of Tier 1 baseline",
-                        })
-                        logger.warning("TUNING: %s promoted %.1f -> %.1f (T2 WR=%.3f, T1 WR=%.3f)",
-                                       param, old_val, new_val, wr, tier1_win_rate)
+                    param = f"tier_1_rsi_{side}"
+                    default = 30.0 if oversold else 70.0
+                    bound = 25.0 if oversold else 75.0
+                    step = -1.0 if oversold else 1.0
+                    direction = "promote"
+                    reason = f"Tier 2 bucket RSI {bucket}-{bucket+3} within 5% of Tier 1 baseline"
                 elif wr <= tier1_win_rate - 0.10:
-                    param = "tier_2_rsi_oversold"
-                    old_val = thresholds.get(param, 35.0)
-                    new_val = min(40.0, old_val + 1.0)
-                    if new_val != old_val and old_val < 40.0:
-                        thresholds[param] = new_val
-                        audit_entries.append({
-                            "timestamp": __import__("time").time(),
-                            "parameter": param,
-                            "old_value": old_val,
-                            "new_value": new_val,
-                            "direction": "tighten",
-                            "sample_size": stats["total"],
-                            "tier2_win_rate": round(wr, 4),
-                            "tier1_win_rate": round(tier1_win_rate, 4),
-                            "reason": f"Tier 2 bucket RSI {bucket}-{bucket+3} underperforms Tier 1 by >10%",
-                        })
-                        logger.warning("TUNING: %s tightened %.1f -> %.1f (T2 WR=%.3f, T1 WR=%.3f)",
-                                       param, old_val, new_val, wr, tier1_win_rate)
-            thresholds["updated_at"] = __import__("time").time()
+                    param = f"tier_2_rsi_{side}"
+                    default = 35.0 if oversold else 65.0
+                    bound = 40.0 if oversold else 60.0
+                    step = 1.0 if oversold else -1.0
+                    direction = "tighten"
+                    reason = f"Tier 2 bucket RSI {bucket}-{bucket+3} underperforms Tier 1 by >10%"
+                else:
+                    return
+                old_val = thresholds.get(param, default)
+                new_val = max(bound, old_val + step) if step < 0 else min(bound, old_val + step)
+                still_room = (old_val > bound) if step < 0 else (old_val < bound)
+                if new_val == old_val or not still_room:
+                    return
+                thresholds[param] = new_val
+                audit_entries.append({
+                    "timestamp": _time.time(),
+                    "parameter": param,
+                    "old_value": old_val,
+                    "new_value": new_val,
+                    "direction": direction,
+                    "sample_size": stats["total"],
+                    "tier2_win_rate": round(wr, 4),
+                    "tier2_win_rate_ci95": [round(ci_low, 4), round(ci_high, 4)],
+                    "tier1_win_rate": round(tier1_win_rate, 4),
+                    "reason": reason,
+                    "recommendation_only": True,
+                })
+                logger.warning(
+                    "THRESHOLD ADVISORY (recommendation only, live thresholds "
+                    "unchanged): %s recommend %.1f -> %.1f "
+                    "(T2 WR=%.3f [%.3f, %.3f] n=%d, T1 WR=%.3f)",
+                    param, old_val, new_val, wr, ci_low, ci_high,
+                    stats["total"], tier1_win_rate,
+                )
+
+            for bucket, stats in sorted(buckets.items()):
+                _evaluate_bucket(bucket, stats, oversold=bucket < 50)
+
+            thresholds["recommendation_only"] = True
+            thresholds["updated_at"] = _time.time()
+            thresholds["data_window"] = data_window
+            thresholds["sample_size"] = len(rows)
+            thresholds["config_hash"] = config_hash
             with open(thresholds_path, "w") as f:
                 json.dump(thresholds, f, indent=2)
             if audit_entries:
@@ -3975,7 +4160,12 @@ class Orchestrator:
                 with open(audit_path, "w") as f:
                     json.dump(audit_data, f, indent=2)
             self.state.tier_2_eval_cycle += 1
-            logger.info("Tier 2 evaluation cycle %d complete", self.state.tier_2_eval_cycle)
+            logger.info(
+                "Threshold advisory cycle %d complete: recommendation generated, "
+                "live thresholds unchanged (n=%d, window=%s..%s)",
+                self.state.tier_2_eval_cycle, len(rows),
+                data_window["start"], data_window["end"],
+            )
             # _save_persisted_mode() was called here. It was harmless while
             # that function was a no-op stub; once implemented it would
             # persist whatever mode happened to be current -- including an
@@ -3983,7 +4173,7 @@ class Orchestrator:
             # pre-halt mode that day-rollover recovery reads back. Only
             # set_mode(), the operator's own action, may write that file.
         except Exception as e:
-            logger.error("Tier 2 evaluation FAILED: %s", e)
+            logger.error("Threshold advisory generation FAILED: %s", e)
 
 
     def _finalize_cycle(self, start: float, result: dict) -> None:
@@ -4062,13 +4252,11 @@ class Orchestrator:
         # Run monitoring checks
         try:
             sent_conv = result.get("steps", {}).get("sentiment", {}).get("conviction", 0.0)
-            prev_conv = self.state.last_sentiment_result.get("conviction_score") if self.state.last_sentiment_result else None
             alert_result = self.alerts.check_cycle(
                 sentiment_conviction=sent_conv,
                 consensus=result.get("steps", {}).get("sentiment", {}).get("consensus", "neutral"),
                 errors=self.state.errors,
                 cycle_count=self.state.cycle_count,
-                prev_conviction=prev_conv,
             )
             result["monitoring"] = alert_result
 
@@ -4079,6 +4267,13 @@ class Orchestrator:
                 logger.info("Sent %d notifications to lead", len(sent_notifs))
         except Exception as e:
             logger.warning("Monitoring check failed: %s", e)
+
+        # Cheap no-op most cycles: the advisory only does anything once 25
+        # more Tier 2 trades have landed since its last run.
+        try:
+            self._generate_tier2_threshold_advisory()
+        except Exception as e:
+            logger.warning("Tier 2 threshold advisory failed: %s", e)
 
                 # ---- Drawdown safety checks ----
         try:
@@ -4113,23 +4308,25 @@ class Orchestrator:
             if self.state.peak_equity > 0:
                 current_dd = (self.state.peak_equity - equity) / self.state.peak_equity * 100.0
             self.state.max_drawdown_pct = max(self.state.max_drawdown_pct, current_dd)
-            if current_dd >= 15.0:
+            _kill_dd_pct = _import_patterns().DRAWDOWN_KILL_PCT * 100.0
+            _halve_dd_pct = _import_patterns().DRAWDOWN_HALVE_PCT * 100.0
+            if current_dd >= _kill_dd_pct:
                 self.state.killed = True
                 self.state.drawdown_killed = True
                 self._write_killed_state_file()
                 logger.warning(
-                    "KILLED flag set (trigger: drawdown %.2f%% >= 15%%) — persisted to %s",
-                    current_dd, KILLED_STATE_FILE,
+                    "KILLED flag set (trigger: drawdown %.2f%% >= %.0f%%) — persisted to %s",
+                    current_dd, _kill_dd_pct, KILLED_STATE_FILE,
                 )
                 logger.critical(
-                    "DRAWDOWN KILL: %.2f%% drawdown exceeds 15%% limit -- killed flag set",
-                    current_dd,
+                    "DRAWDOWN KILL: %.2f%% drawdown exceeds %.0f%% limit -- killed flag set",
+                    current_dd, _kill_dd_pct,
                 )
-            elif current_dd >= 6.0:
+            elif current_dd >= _halve_dd_pct:
                 self.state.position_size_multiplier = 0.5
                 logger.warning(
-                    "DRAWDOWN HALVING: %.2f%% drawdown exceeds 6%% -- position sizes halved",
-                    current_dd,
+                    "DRAWDOWN HALVING: %.2f%% drawdown exceeds %.0f%% -- position sizes halved",
+                    current_dd, _halve_dd_pct,
                 )
             else:
                 self.state.position_size_multiplier = 1.0
@@ -4904,11 +5101,8 @@ class Orchestrator:
         try:
             backup_dir = os.path.join(DATA_DIR, "backups") + "/"
             os.makedirs(backup_dir, exist_ok=True)
-            db_path = os.path.join(APP_ROOT, "data", "patterns.db")
-            if not os.path.exists(db_path):
-                # check alternative locations
-                db_path = "data/patterns.db"
-            
+            db_path = os.path.join(DATA_DIR, "patterns.db")
+
             if os.path.exists(db_path):
                 date_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                 backup_db = os.path.join(backup_dir, f"patterns_{date_str}.db")

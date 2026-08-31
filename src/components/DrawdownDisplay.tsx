@@ -1,24 +1,9 @@
-import { useEffect, useRef, useState } from "react";
 import { TrendingDown, DollarSign, BarChart3, Gauge } from "lucide-react";
 
 export function DrawdownDisplay({ equity, peakEquity: externalPeak }: { equity: number; peakEquity?: number }) {
-  const [peakEquity, setPeakEquity] = useState(externalPeak || equity);
-  const initializedRef = useRef(false);
-
-  useEffect(() => {
-    if (!initializedRef.current) {
-      setPeakEquity(equity);
-      initializedRef.current = true;
-    } else if (equity > peakEquity) {
-      setPeakEquity(equity);
-    }
-  }, [equity, peakEquity]);
-
-  useEffect(() => {
-    if (externalPeak && externalPeak > peakEquity) {
-      setPeakEquity(externalPeak);
-    }
-  }, [externalPeak]);
+  // The parent tracks peak equity across polls and passes it down; fall back
+  // to current equity only for the first render before that prop arrives.
+  const peakEquity = Math.max(externalPeak ?? equity, equity);
 
   const drawdownPct = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
   const drawdownAbs = peakEquity - equity;
